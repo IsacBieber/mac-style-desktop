@@ -1,4 +1,13 @@
+using MacDesk.Core;
 using System;using System.IO;using System.Drawing;using System.Diagnostics;using System.Threading;using System.Windows.Forms;using System.Runtime.InteropServices;using System.Reflection;using System.Security.Cryptography;using System.Text;using System.Web.Script.Serialization;
+[assembly: AssemblyTitle("MacDesk Native Desktop")]
+[assembly: AssemblyDescription("Mac Style Glass Desktop Folders and Widgets for Windows 11")]
+[assembly: AssemblyCompany("IsacBieber")]
+[assembly: AssemblyProduct("MacDesk")]
+[assembly: AssemblyCopyright("Copyright (C) 2026 IsacBieber")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
+
 namespace MacDeskNative {
  public static class NativeDesktop {
   // Keep Home above the verified Shell desktop, below ordinary windows. Never reparent,
@@ -46,7 +55,8 @@ namespace MacDeskNative {
    }
    return false;
   }
-  static IntPtr home,foregroundHook,reorderHook;static LayerWindow layer;
+  static IntPtr home,companion,foregroundHook,reorderHook;static LayerWindow layer;
+  public static void SetCompanion(IntPtr window){companion=window;}
   static readonly WinEventProc eventProc=OnEvent;
   static bool pending,applying,fallbackApplied;
   public static string LayerError {get;private set;}
@@ -88,21 +98,22 @@ namespace MacDeskNative {
     IntPtr shell=GetShellWindow();uint shellPid;GetWindowThreadProcessId(shell,out shellPid);
     var list=new System.Collections.Generic.List<LayerItem>();
     EnumWindows(delegate(IntPtr h,IntPtr p){bool desktop=IsDesktopSurface(h,shellPid);int cloak=0;bool visible=IsWindowVisible(h)&&!IsIconic(h);if(visible){int hr=DwmGetWindowAttribute(h,14,out cloak,4);if(hr!=0)cloak=0;}
-     list.Add(new LayerItem{Window=h,Desktop=desktop,Eligible=visible&&cloak==0&&(GetWindowLong(h,-20)&8)==0});return !desktop;},IntPtr.Zero);
+     list.Add(new LayerItem{Window=h,Desktop=desktop,Eligible=h!=companion&&visible&&cloak==0&&(GetWindowLong(h,-20)&8)==0});return !desktop;},IntPtr.Zero);
     IntPtr after;bool move;bool found=PlanLayer(list.ToArray(),home,out after,out move);
     if(diagnosticPath!=null){IntPtr desktop=IntPtr.Zero;foreach(var item in list)if(item.Desktop){desktop=item.Window;break;}plan=new{shell=Observe(shell),desktop=Observe(desktop),after=Observe(after),point=new{x=before.L+(before.R-before.L)/2,y=before.T+Math.Min(304,(before.B-before.T)/2)},found=found,move=move,fallbackBefore=fallbackApplied,items=list.ConvertAll(v=>new{window=v.Window.ToInt64(),desktop=v.Desktop,eligible=v.Eligible})};}
     if(!found){
-     if(AllowFallback(false,ref fallbackApplied)){LayerError="No verified desktop surface; ordinary non-topmost fallback";actualInsertAfter=1;positioned=SetWindowPos(home,new IntPtr(1),0,0,0,0,PositionFlags);positionError=positioned.Value?0:Marshal.GetLastWin32Error();if(!positioned.Value)LayerError+="; SetWindowPos: "+positionError;}
+     if(AllowFallback(false,ref fallbackApplied)){LayerError="No verified desktop surface; keeping ordinary non-topmost state";}
      return;
     }
     AllowFallback(true,ref fallbackApplied);
     if(move){actualInsertAfter=after.ToInt64();positioned=SetWindowPos(home,after,0,0,0,0,PositionFlags);positionError=positioned.Value?0:Marshal.GetLastWin32Error();if(!positioned.Value){LayerError="SetWindowPos: "+positionError;return;}}
+    if(companion!=IntPtr.Zero&&IsWindow(companion)&&(GetWindowLong(companion,-16)&0x40000000)==0){SetWindowPos(companion,home,0,0,0,0,PositionFlags);}
     LayerError=null;
    }catch(Exception ex){LayerError=ex.Message;}finally{try{if(diagnosticPath!=null)Trace("pass",new{before=before,plan=plan,actualInsertAfter=actualInsertAfter,positioned=positioned,error=positionError,after=Observe(home),layerError=LayerError,hookError=HookError});}catch(Exception ex){Debug.WriteLine(ex);}finally{applying=false;}}
   }
   public static void Lower(IntPtr window){
    if(window==IntPtr.Zero||!IsWindow(window))return;
-   if((GetWindowLong(window,-16)&0x40000000)!=0){if(layer!=null&&layer.Handle!=IntPtr.Zero)layer.ReleaseHandle();Release();return;} // child follows its real desktop surface; never global Z positioning
+   if((GetWindowLong(window,-16)&0x40000000)!=0){NativeDesktopHost.EnsureChildTopOrder(window,companion);if(layer!=null&&layer.Handle!=IntPtr.Zero)layer.ReleaseHandle();Release();return;} // child follows its real desktop surface; keep above SysListView32 inside SHELLDLL_DefView
    if(home!=window){if(layer!=null&&layer.Handle!=IntPtr.Zero)layer.ReleaseHandle();Release();home=window;layer=new LayerWindow(window);}
    // Retry missing hooks on explicit Lower/HandleCreated, not from a recurring timer.
    if(foregroundHook==IntPtr.Zero){foregroundHook=SetWinEventHook(3,3,IntPtr.Zero,eventProc,0,0,0);int error=Marshal.GetLastWin32Error();ForegroundHookError=foregroundHook==IntPtr.Zero?"Foreground hook: "+error:null;}
@@ -111,32 +122,59 @@ namespace MacDeskNative {
   }
  }
  public static class Program {
-  [STAThread]public static int Main(string[] args){string root=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"MacDesk");bool launch=false,diagnostics=false,selfTest=Array.IndexOf(args,"--self-test")>=0;
+  [STAThread]public static int Main(string[] args){
+   if(args.Length>0&&args[0]=="--bench")return Bench.Run(args.Length>1?Path.GetFullPath(args[1]):Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"bench.txt"));
+   string root=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"MacDesk");bool launch=false,diagnostics=false,selfTest=Array.IndexOf(args,"--self-test")>=0;
    try{root=ParseArguments(args,out launch,out diagnostics,out selfTest);if(diagnostics)WriteLog(Path.Combine(root,"native-start.txt"),DateTime.Now.ToString("o")+" PID="+Process.GetCurrentProcess().Id+" Root="+root+Environment.NewLine+String.Join(Environment.NewLine,args));if(selfTest){SelfTest();return 0;}
     if(launch){string exe=Assembly.GetExecutingAssembly().Location;EntryServices.Open(new DeskItem{type="app",target=exe,arguments="--root \""+root+"\""});return 0;}
     string name;using(var hash=SHA256.Create())name="Local\\MacDeskNative-"+BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(root.ToLowerInvariant()))).Replace("-","").Substring(0,16);
     bool created;using(var mutex=new Mutex(true,name,out created)){if(!created)return 0;Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-     if(diagnostics)NativeDesktop.ConfigureDiagnostics(root);
-    using(NativeDesktopHost.Prepare())using(var app=new AppController(root)){ThreadExceptionEventHandler errorHandler=delegate(object sender,ThreadExceptionEventArgs e){WriteLog(Path.Combine(root,"native-error.log"),DateTime.Now.ToString("o")+" "+e.Exception+Environment.NewLine);app.ReportError(e.Exception);};Application.ThreadException+=errorHandler;try{if(diagnostics){WriteStatus(app,root,"constructed");EventHandler ready=null;ready=delegate{Application.Idle-=ready;WriteStatus(app,root,"ready");};Application.Idle+=ready;}Application.Run(app);if(diagnostics)WriteStatus(app,root,"exited");}finally{Application.ThreadException-=errorHandler;}}
+     NativeDesktop.ConfigureDiagnostics(root);
+     Exception startupThreadEx=null;
+     ThreadExceptionEventHandler bootHandler=delegate(object sender,ThreadExceptionEventArgs e){startupThreadEx=e.Exception;WriteLog(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"startup-thread-error.log"),DateTime.Now.ToString("o")+" "+e.Exception+Environment.NewLine);};
+     Application.ThreadException+=bootHandler;
+     using(NativeDesktopHost.Prepare())using(var app=new AppController(root)){if(startupThreadEx!=null)throw startupThreadEx;Application.ThreadException-=bootHandler;ThreadExceptionEventHandler errorHandler=delegate(object sender,ThreadExceptionEventArgs e){WriteLog(Path.Combine(root,"native-error.log"),DateTime.Now.ToString("o")+" "+e.Exception+Environment.NewLine);app.ReportError(e.Exception);};Application.ThreadException+=errorHandler;try{WriteStatus(app,root,"constructed");EventHandler ready=null;ready=delegate{Application.Idle-=ready;WriteStatus(app,root,"ready");};Application.Idle+=ready;Application.Run(app);WriteStatus(app,root,"exited");}finally{Application.ThreadException-=errorHandler;}}
     }return 0;
    }catch(Exception ex){if(selfTest){WriteLog(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"self-test-error.log"),ex.ToString());return 1;}WriteLog(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"startup-error.log"),ex.ToString());if(!launch)MessageBox.Show(ex.Message,"MacDesk · 启动失败",MessageBoxButtons.OK,MessageBoxIcon.Warning);return 1;}
   }
   static void WriteLog(string path,string message){try{Directory.CreateDirectory(Path.GetDirectoryName(path));File.WriteAllText(path,message);}catch{Debug.WriteLine(message);}}
   public static string ParseArguments(string[] args,out bool launch,out bool diagnostics,out bool selfTest){string root=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"MacDesk");launch=false;diagnostics=false;selfTest=false;bool hasRoot=false;for(int i=0;i<args.Length;i++){switch(args[i]){case "--root":if(hasRoot||i+1>=args.Length||String.IsNullOrWhiteSpace(args[i+1])||args[i+1].StartsWith("--",StringComparison.Ordinal))throw new ArgumentException("--root 必须指定且只能指定一次测试数据目录。");hasRoot=true;root=args[++i];break;case "--launch":launch=true;break;case "--diagnostics":diagnostics=true;break;case "--self-test":selfTest=true;break;default:throw new ArgumentException("不支持的启动参数："+args[i]);}}if(launch&&selfTest)throw new ArgumentException("启动与自测模式不能混用。");root=Path.GetFullPath(root);string drive=Path.GetPathRoot(root);if(root.Length>drive.Length)root=root.TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar);return root;}
-  static void WriteStatus(AppController app,string root,string phase){try{var h=app.Home;var c=app.DesktopFolders;IntPtr ch=c!=null&&!c.IsDisposed&&c.IsHandleCreated?c.Handle:IntPtr.Zero;IntPtr hh=!h.IsDisposed&&h.IsHandleCreated?h.Handle:IntPtr.Zero;var status=new{phase=phase,pid=Process.GetCurrentProcess().Id,root=app.Store.Root,groups=app.Data.groups.ConvertAll(g=>new{id=g.id,title=g.title,count=g.items.Count,desktopX=g.desktopX,desktopY=g.desktopY}),foldersHandle=ch.ToInt64(),foldersVisible=c!=null&&!c.IsDisposed&&c.Visible,homeHandle=hh.ToInt64(),visible=!h.IsDisposed&&h.Visible,title=h.Text,x=h.Left,y=h.Top,width=h.Width,height=h.Height,desktop=new{policy=h.DesktopChildMode?"desktop-view-child-no-global-zorder":"home-only-nontopmost-zorder",hostHealthy=NativeDesktopHost.IsHosted(hh),host=NativeDesktopHost.Parent.ToInt64(),hostError=NativeDesktopHost.Error,foregroundHook=NativeDesktop.ForegroundHookReady,reorderHook=NativeDesktop.ReorderHookReady,hookError=NativeDesktop.HookError,layerError=NativeDesktop.LayerError}};WriteLog(Path.Combine(root,"native-session.json"),new JavaScriptSerializer().Serialize(status));NativeDesktop.FlushDiagnostics();}catch(Exception ex){Debug.WriteLine(ex);}}
+  static void WriteStatus(AppController app,string root,string phase){try{var h=app.Home;var c=app.DesktopFolders;IntPtr ch=c!=null&&!c.IsDisposed&&c.IsHandleCreated?c.Handle:IntPtr.Zero;IntPtr hh=!h.IsDisposed&&h.IsHandleCreated?h.Handle:IntPtr.Zero;var status=new{phase=phase,pid=Process.GetCurrentProcess().Id,root=app.Service.Root,groups=app.Data.groups.ConvertAll(g=>new{id=g.id,title=g.title,count=g.items.Count,desktopX=g.desktopX,desktopY=g.desktopY}),foldersHandle=ch.ToInt64(),foldersVisible=c!=null&&!c.IsDisposed&&c.Visible,homeHandle=hh.ToInt64(),visible=!h.IsDisposed&&h.Visible,title=h.Text,x=h.Left,y=h.Top,width=h.Width,height=h.Height,desktop=new{policy=h.DesktopChildMode?"desktop-view-child-no-global-zorder":"home-only-nontopmost-zorder",hostHealthy=NativeDesktopHost.IsHosted(hh),host=NativeDesktopHost.Parent.ToInt64(),hostError=NativeDesktopHost.Error,hostChildren=NativeDesktopHost.DescribeHostChildren(),foregroundHook=NativeDesktop.ForegroundHookReady,reorderHook=NativeDesktop.ReorderHookReady,hookError=NativeDesktop.HookError,layerError=NativeDesktop.LayerError}};WriteLog(Path.Combine(root,"native-session.json"),new JavaScriptSerializer().Serialize(status));NativeDesktop.FlushDiagnostics();}catch(Exception ex){Debug.WriteLine(ex);}}
   static void Check(bool value,string name){if(!value)throw new Exception("Self test failed: "+name);}
-  public static void SelfTest(){string root=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"IntegrationTests",Guid.NewGuid().ToString("N"));Directory.CreateDirectory(root);bool launch,diagnostics,selfTest;Check(ParseArguments(new[]{"--diagnostics","--root",root+Path.DirectorySeparatorChar},out launch,out diagnostics,out selfTest)==root&&diagnostics,"canonical explicit root");foreach(var bad in new[]{new[]{"--root"},new[]{"--root","--diagnostics"},new[]{"--rooot",root},new[]{"--root",root,"--root",root},new[]{"--self-test","--launch"}}){bool rejected=false;try{ParseArguments(bad,out launch,out diagnostics,out selfTest);}catch(ArgumentException){rejected=true;}Check(rejected,"invalid startup arguments fail closed");}string file=Path.Combine(root,"原文件.txt");File.WriteAllText(file,"UNCHANGED");
-   using(var app=new AppController(root,false)){
-    app.Change(d=>{d.groups.Add(new DeskGroup{id="one",title="分类一",subtitle=""});d.groups.Add(new DeskGroup{id="two",title="分类二",subtitle=""});});
-    app.AddPaths("one",new[]{file},-1);string first=app.Data.groups[0].items[0].id;app.AddUrl("one","https://example.com/",-1);string second=app.Data.groups[0].items[1].id;
-    app.MoveItem("one",first,"one",2);Check(app.Data.groups[0].items[0].id==second,"same group insert gap");
-    app.MoveItem("one",first,"two",-1);Check(app.Data.groups[0].items.Count==1&&app.Data.groups[1].items[0].id==first,"cross group transfer");
-    app.MoveGroup("one",2);Check(app.Data.groups[1].id=="one","category reorder");
-    var fresh=new DesktopStore(root);Check(fresh.Data.groups[0].items[0].id==first,"restart persistence");Check(File.ReadAllText(file)=="UNCHANGED","never move source file");
-    var old=fresh.Data.groups[0].title;try{fresh.Edit(d=>{d.groups[0].title="";});throw new Exception("Invalid title accepted");}catch(InvalidDataException){}Check(fresh.Data.groups[0].title==old,"validation rollback");
+  // `--self-test`: backend tests (Core/CoreTests) + frontend unit checks. No window is shown.
+  public static void SelfTest(){
+   string baseDir=AppDomain.CurrentDomain.BaseDirectory;
+   if(baseDir.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.Windows),StringComparison.OrdinalIgnoreCase))baseDir=Environment.CurrentDirectory;
+   string root=Path.Combine(baseDir,"IntegrationTests",Guid.NewGuid().ToString("N"));
+   Directory.CreateDirectory(root);
+   // Host: startup arguments.
+   bool launch,diagnostics,selfTest;
+   Check(ParseArguments(new[]{"--diagnostics","--root",root+Path.DirectorySeparatorChar},out launch,out diagnostics,out selfTest)==root&&diagnostics,"canonical explicit root");
+   foreach(var bad in new[]{new[]{"--root"},new[]{"--root","--diagnostics"},new[]{"--rooot",root},new[]{"--root",root,"--root",root},new[]{"--self-test","--launch"}}){bool rejected=false;try{ParseArguments(bad,out launch,out diagnostics,out selfTest);}catch(ArgumentException){rejected=true;}Check(rejected,"invalid startup arguments fail closed");}
+   // Backend.
+   CoreTests.Run(Path.Combine(root,"core"));
+   // Frontend: motion curves, springs, grid snapping, controller wiring.
+   Check(AppController.EvaluateSpring(0.0,false)==0.0&&AppController.EvaluateSpring(1.0,false)==1.0&&AppController.EvaluateSpring(1.0,true)==1.0,"spring boundaries");
+   double peak=0;for(int i=1;i<100;i++)peak=Math.Max(peak,AppController.EvaluateSpring(i/100.0,false));
+   Check(peak>1.0&&peak<1.05,"open spring has a subtle overshoot");
+   Check(AppController.EvaluateSpring(0.25,false)>0.5,"open spring responds quickly");
+   double prev=0;bool monotone=true;for(int i=1;i<=100;i++){double v=AppController.EvaluateSpring(i/100.0,true);if(v<prev-1e-9)monotone=false;prev=v;}
+   Check(monotone&&prev==1.0,"closing spring is critically damped");
+   var spring=new Spring(0,0.3,0.8);spring.Target=1;for(int i=0;i<240;i++)spring.Step(1/240.0);var spring60=new Spring(0,0.3,0.8);spring60.Target=1;for(int i=0;i<60;i++)spring60.Step(1/60.0);
+   Check(spring.Settled&&spring60.Settled&&Math.Abs(spring.Value-1)<0.001,"interactive springs settle the same at 60 and 240 Hz");
+   Point snapped=DesktopFolderForm.SnapPointToGrid(455,31,440,1920,1080);
+   Check(snapped.X==440&&snapped.Y==24,"magnetic grid snap origin");
+   Point snapped2=DesktopFolderForm.SnapPointToGrid(440+132+18,24+148-12,440,1920,1080);
+   Check(snapped2.X==440+132&&snapped2.Y==24+148,"magnetic grid snap second slot");
+   string uiRoot=Path.Combine(root,"ui");Directory.CreateDirectory(uiRoot);
+   using(var app=new AppController(uiRoot,false,true)){
+    Check(app.Data.groups.Count==4,"controller seeds starter folders before Home");
+    string g=app.Data.groups[0].id;
+    Check(app.RenameGroupInline(g,"重命名")&&app.Data.groups[0].title=="重命名","controller forwards to the backend");
+    Check(!app.RenameGroupInline(g,"  "),"controller ignores empty inline rename");
     app.Quit();
    }
-   File.WriteAllText(Path.Combine(root,"PASS.txt"),"Controller AddPaths/AddUrl/reorder/cross-group/restart/validation/source-protection tests passed.");
+   File.WriteAllText(Path.Combine(root,"PASS.txt"),"Backend (CoreTests) and frontend self-tests passed.");
   }
  }
 }

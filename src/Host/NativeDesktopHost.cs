@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 
+using MacDesk.Core;
+
 namespace MacDeskNative
 {
     /// <summary>
@@ -18,6 +20,30 @@ namespace MacDeskNative
 
         public static IntPtr Parent { get; private set; }
         public static string Error { get; private set; }
+
+        public static void DisableChildHosting(string reason)
+        {
+            Parent = IntPtr.Zero;
+            Error = reason;
+        }
+
+        public static void ResetStaleHandle(System.Windows.Forms.Control control)
+        {
+            try
+            {
+                var wf = typeof(System.Windows.Forms.Control).GetField("window", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (wf != null)
+                {
+                    var nw = wf.GetValue(control) as System.Windows.Forms.NativeWindow;
+                    if (nw != null && nw.Handle != IntPtr.Zero)
+                    {
+                        DestroyWindow(nw.Handle);
+                        nw.ReleaseHandle();
+                    }
+                }
+            }
+            catch { }
+        }
 
 #if DESKTOP_HOST_TESTS
         // Hidden fake-host tests only: do not discover Shell, change DPI, or write any HWND.
@@ -72,8 +98,62 @@ namespace MacDeskNative
         private static extern IntPtr GetThreadDpiAwarenessContext();
         [DllImport("user32.dll", ExactSpelling = true)]
         private static extern bool AreDpiAwarenessContextsEqual(IntPtr first, IntPtr second);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr window, uint command);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyWindow(IntPtr window);
         [DllImport("kernel32.dll", ExactSpelling = true)]
         private static extern uint GetCurrentThreadId();
+
+        public static void EnsureChildTopOrder(IntPtr primaryChild, IntPtr secondaryChild)
+        {
+            IntPtr parent = Parent;
+            if (parent == IntPtr.Zero || !IsWindow(parent))
+                return;
+            bool hasPrimary = primaryChild != IntPtr.Zero && IsWindow(primaryChild) && GetParent(primaryChild) == parent;
+            bool hasSecondary = secondaryChild != IntPtr.Zero && IsWindow(secondaryChild) && GetParent(secondaryChild) == parent;
+            if (!hasPrimary && !hasSecondary)
+                return;
+
+            IntPtr first = GetWindow(parent, 5); // GW_CHILD
+            bool alreadyOrdered = hasPrimary
+                ? (first == primaryChild && (!hasSecondary || GetWindow(primaryChild, 2) == secondaryChild))
+                : (first == secondaryChild);
+            if (alreadyOrdered)
+                return;
+
+            const uint flags = 0x0001 | 0x0002 | 0x0010 | 0x0200; // SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+            if (hasSecondary)
+                SetWindowPos(secondaryChild, IntPtr.Zero, 0, 0, 0, 0, flags);
+            if (hasPrimary)
+                SetWindowPos(primaryChild, IntPtr.Zero, 0, 0, 0, 0, flags);
+        }
+
+        public static object[] DescribeHostChildren()
+        {
+            IntPtr parent = Parent;
+            if (parent == IntPtr.Zero || !IsWindow(parent))
+                return new object[0];
+            var list = new System.Collections.Generic.List<object>();
+            IntPtr cur = GetWindow(parent, 5); // GW_CHILD
+            int guard = 0;
+            while (cur != IntPtr.Zero && guard++ < 64)
+            {
+                uint pid;
+                GetWindowThreadProcessId(cur, out pid);
+                list.Add(new
+                {
+                    handle = cur.ToInt64(),
+                    className = ClassName(cur),
+                    pid = pid,
+                    visible = IsWindowVisible(cur)
+                });
+                cur = GetWindow(cur, 2); // GW_HWNDNEXT
+            }
+            return list.ToArray();
+        }
 
         /// <summary>
         /// Call once on the UI thread BEFORE constructing the real App or any of its HWNDs;
