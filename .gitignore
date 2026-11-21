@@ -1,0 +1,7 @@
+build/
+*.exe
+*.pdb
+*.user
+.vs/
+desktop.json
+Backups/
