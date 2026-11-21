@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Text;
 
@@ -14,6 +15,7 @@ namespace MacDeskNative {
    public readonly string Name; double sum, max; int n;
    public Stat(string name) { Name = name; }
    public void Add(double ms) { sum += ms; n++; if (ms > max) max = ms; }
+   public double Max { get { return max; } }
    public override string ToString() { return String.Format("{0,-28} avg {1,6:0.00} ms   max {2,6:0.00} ms   frames {3}", Name, n == 0 ? 0 : sum / n, max, n); }
   }
 
@@ -25,6 +27,33 @@ namespace MacDeskNative {
     stat.Add((Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency);
    }
    return stat;
+  }
+
+  // The open/close transition of a real folder, offscreen: structural invariants (icons stay
+  // inside the glass, move monotonically, land exactly on the open panel's pixels, reversal is
+  // continuous) and the cost of a transition frame.
+  internal static Stat[] Transition(FolderLayer layer) {
+   Rectangle work = System.Windows.Forms.Screen.PrimaryScreen.WorkingArea;
+   var tile = new Rectangle(work.Left + 676, work.Top + 30, Metrics.DesktopIcon, Metrics.DesktopIcon);
+   layer.PrepareTransitionForTest(work, tile);
+   string problem = layer.CheckTransitionInvariants();
+   var invariants = new Stat("transition invariants: " + (problem ?? "OK (inside frame, monotonic, lands on layout, reversible)"));
+   invariants.Add(problem == null ? 0 : 1);
+   // The first frame of an open clears and presents the whole layer once; report it apart.
+   var first = new Stat("open/close first frame");
+   first.Add(layer.TransitionFrameMs(0));
+   var frames = new Stat("open/close transition frame");
+   double worst = 0, worstP = 0;
+   for (int k = 1; k <= 240; k++) {
+    double p = (k <= 120 ? k : 240 - k) / 120.0; // open, then close
+    double ms = layer.TransitionFrameMs(p);
+    frames.Add(ms);
+    if (ms > worst) { worst = ms; worstP = p; }
+   }
+   layer.TransitionFrameMs(1); // leave it open for the panel benches
+   var slowest = new Stat("slowest transition frame at p=" + worstP.ToString("0.000"));
+   slowest.Add(worst);
+   return new[] { invariants, first, frames, slowest };
   }
 
   internal static int Run(string output) {
@@ -42,8 +71,9 @@ namespace MacDeskNative {
      DeskGroup biggest = null;
      foreach (var g in app.Data.groups) if (biggest == null || g.items.Count > biggest.items.Count) biggest = g;
      if (biggest != null) {
-      var panel = new PanelForm(app, biggest.id);
-      panel.WarmCaches(true); // the real app does this at startup idle
+      var panel = new FolderLayer(app, biggest.id);
+      panel.WarmCaches(true); // measure steady rendering with already-loaded icons and labels
+      foreach (Stat s in Transition(panel)) report.AppendLine(s.ToString());
       foreach (Stat s in panel.Bench()) report.AppendLine(s.ToString());
       panel.Dispose();
      }

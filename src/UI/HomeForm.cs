@@ -14,22 +14,11 @@ namespace MacDeskNative {
   readonly LayeredSurface surface = new LayeredSurface();
   readonly FramePump pump;
 
-  readonly Font captionFont = Ui.MakeFont(Ui.Cjk, 13f, FontStyle.Regular);
-  readonly Font clockFont = Ui.MakeFont(Ui.DisplayRegular, 76f, FontStyle.Regular);
-  readonly Font dateFont = Ui.MakeFont(Ui.Cjk, 15f, FontStyle.Regular);
-  readonly Font pillFont = Ui.MakeFont(Ui.Cjk, 12.5f, FontStyle.Bold);
-  readonly Font ringFont = Ui.MakeFont(Ui.TextSemibold, 11f, FontStyle.Regular);
-  readonly Font monthFont = Ui.MakeFont(Ui.Cjk, 15f, FontStyle.Bold);
-  readonly Font yearFont = Ui.MakeFont(Ui.TextRegular, 15f, FontStyle.Regular);
-  readonly Font weekdayFont = Ui.MakeFont(Ui.Cjk, 11.5f, FontStyle.Bold);
-  readonly Font dayFont = Ui.MakeFont(Ui.TextRegular, 15f, FontStyle.Regular);
-  readonly Font dayBoldFont = Ui.MakeFont(Ui.TextSemibold, 15f, FontStyle.Regular);
-  readonly Font noteFont = Ui.MakeFont(Ui.Cjk, 12.5f, FontStyle.Regular);
   readonly Font chevronFont = Ui.MakeFont(Ui.TextSemibold, 17f, FontStyle.Regular);
 
   static readonly Rectangle ClockCard = new Rectangle(4, 4, 344, 206);
-  static readonly Rectangle MonthCard = new Rectangle(4, 226, 344, 322);
-  static readonly Rectangle FocusButton = new Rectangle(250, 22, 80, 28);
+  const int MonthTop = 226, CardWidth = 344, WidgetWidth = 356;
+  const int CalendarBottomPadding = 11, NoteHeight = 24;
   static readonly Rectangle PrevMonth = new Rectangle(258, 240, 34, 30);
   static readonly Rectangle NextMonth = new Rectangle(296, 240, 34, 30);
   static readonly Rectangle TodayButton = new Rectangle(196, 241, 58, 28);
@@ -39,23 +28,25 @@ namespace MacDeskNative {
   TextureBrush wallpaperBrush;
   Backdrop wallpaperSource;
   Point wallpaperOrigin;
+  Rectangle wallpaperRegion;
 
   bool rendering, draggingCard;
   Point mouseClient = new Point(-999, -999);
-  Point dragDownScreen, dragOrigLoc;
-  int monthOffset, hoveredDay = -1, pressedTarget;
-  readonly Spring cardHover = new Spring(0, 0.2, 1.0);
+  Point dragDownScreen, dragOrigLoc, dragTargetLocation;
+  enum CalendarTarget { None, PreviousMonth, NextMonth, Today, Day }
+  int monthOffset, hoveredDay = -1;
+  CalendarTarget pressedTarget;
   readonly Spring monthHover = new Spring(0, 0.2, 1.0);
   readonly Spring monthSlide = new Spring(0, 0.34, 0.86);
   readonly Spring dayHover = new Spring(0, 0.16, 1.0);
-  readonly Spring focusPress = new Spring(1, 0.22, 0.55);
   readonly Spring navPress = new Spring(1, 0.22, 0.55);
-  readonly Spring dragLift = new Spring(0, 0.24, 0.9);
   int dayHoverTarget = -1;
-
-  const int FocusDurationSeconds = 25 * 60;
-  bool focusRunning;
-  DateTime focusEndUtc;
+  long renderedMinute = -1;
+  Rectangle MonthCard, GridRegion, FooterRegion;
+  DateTime calendarMonth;
+  DesktopData calendarData;
+  readonly string[] monthNotes = new string[32];
+  bool gridDirty = true;
 
   public bool DesktopChildMode { get; private set; }
 
@@ -76,9 +67,10 @@ namespace MacDeskNative {
    int initX = (app.Data.homeX >= 0 && app.Data.homeY >= 0) ? app.Data.homeX : 276;
    int initY = (app.Data.homeX >= 0 && app.Data.homeY >= 0) ? app.Data.homeY : 56;
    Location = new Point(initX, initY);
-   Size = new Size(356, 554);
+   UpdateCalendarLayout(DisplayedMonth(BeijingFromUtc(DateTime.UtcNow)));
    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint, true);
    AccessibleName = "桌面小组件：北京时间和月历";
+   AccessibleDescription = "点击日期写备忘，滚轮切换月份。";
    pump = new FramePump(this, Tick);
    Wallpaper.Changed += OnWallpaperChanged;
 
@@ -87,7 +79,6 @@ namespace MacDeskNative {
    menu.Items.Add("新建桌面文件夹", null, delegate {
     BeginInvoke((Action)delegate { if (!IsDisposed) app.CreateAndOpenNewGroup(PointToScreen(new Point(480, 120))); });
    });
-   menu.Items.Add("开始 / 结束 25 分钟专注", null, delegate { ToggleFocusTimer(); });
    menu.Items.Add("回到本月", null, delegate { ChangeMonth(-monthOffset); });
    menu.Items.Add(new ToolStripSeparator());
    menu.Items.Add("退出 MacDesk", null, delegate { BeginInvoke((Action)delegate { if (!IsDisposed) app.Quit(); }); });
@@ -95,12 +86,9 @@ namespace MacDeskNative {
 
    timer.Interval = 1000;
    timer.Tick += delegate {
-    if (focusRunning && DateTime.UtcNow >= focusEndUtc) {
-     focusRunning = false;
-     app.NotifyFocusCompleted();
-    }
     EnsureZOrder();
-    Render();
+    if (DateTime.UtcNow.Ticks / TimeSpan.TicksPerMinute != renderedMinute) Render();
+    else Wallpaper.RefreshIfNeeded();
    };
    timer.Start();
    RefreshData();
@@ -172,12 +160,6 @@ namespace MacDeskNative {
    Render();
   }
 
-  void ToggleFocusTimer() {
-   if (focusRunning) focusRunning = false;
-   else { focusRunning = true; focusEndUtc = DateTime.UtcNow.AddSeconds(FocusDurationSeconds); }
-   Render();
-  }
-
   void ChangeMonth(int delta) {
    if (delta == 0) return;
    monthOffset += delta;
@@ -193,9 +175,12 @@ namespace MacDeskNative {
 
   void Wake() { if (!IsDisposed && IsHandleCreated) pump.Start(); }
 
-  // Offscreen benchmark: hover across calendar days, then flip months.
+  // Offscreen benchmark: hover across calendar days, flip months, then drag the widgets.
   internal Bench.Stat[] Bench() {
    IntPtr h = Handle;
+   string dir = Environment.GetEnvironmentVariable("MACDESK_BENCH_FRAMES");
+   Render();
+   if (dir != null) surface.SaveSnapshot(System.IO.Path.Combine(dir, "home.png"));
    mouseClient = new Point(MonthCard.X + 60, MonthCard.Y + 120);
    int k = 0;
    var hover = MacDeskNative.Bench.Time("calendar day hover", 20 * 12, delegate {
@@ -208,26 +193,46 @@ namespace MacDeskNative {
     if (k++ % 60 == 0) ChangeMonth(1);
     Tick(1 / 240.0);
    });
+   var drag = BenchDrag();
    pump.Stop();
-   return new[] { hover, flip };
+   return new[] { hover, flip, drag };
+  }
+
+  private Bench.Stat BenchDrag() {
+   Point original = Location;
+   dragOrigLoc = dragTargetLocation = original;
+   dragDownScreen = PointToScreen(new Point(12, 22));
+   draggingCard = true;
+   try {
+    int sample = 0;
+    return MacDeskNative.Bench.Time("clock and calendar drag", 240, delegate {
+     for (int i = 0; i < 4; i++) {
+      int index = sample++;
+      Point client = PointToClient(new Point(dragDownScreen.X + index % 340, dragDownScreen.Y + (index % 128) / 2));
+      OnMouseMove(new MouseEventArgs(MouseButtons.Left, 0, client.X, client.Y, 0));
+     }
+     Tick(1 / 240.0);
+    });
+   } finally {
+    Location = original;
+    draggingCard = false;
+   }
   }
 
   bool Tick(double dt) {
+   if (draggingCard) {
+    ApplyDragTarget();
+    return true;
+   }
    bool active = false;
-   cardHover.Target = ClockCard.Contains(mouseClient) ? 1 : 0;
    monthHover.Target = MonthCard.Contains(mouseClient) ? 1 : 0;
    if (dayHoverTarget != hoveredDay) { dayHoverTarget = hoveredDay; dayHover.Snap(0); }
    dayHover.Target = hoveredDay > 0 ? 1 : 0;
-   focusPress.Target = pressedTarget == 1 ? 0.92 : 1;
-   navPress.Target = pressedTarget == 2 || pressedTarget == 3 ? 0.88 : 1;
-   dragLift.Target = draggingCard ? 1 : 0;
-   active |= cardHover.Step(dt);
+   navPress.Target = pressedTarget == CalendarTarget.PreviousMonth || pressedTarget == CalendarTarget.NextMonth ? 0.88 : 1;
    active |= monthHover.Step(dt);
    active |= monthSlide.Step(dt);
    active |= dayHover.Step(dt);
-   active |= focusPress.Step(dt);
    active |= navPress.Step(dt);
-   active |= dragLift.Step(dt);
    Render();
    return active;
   }
@@ -236,15 +241,20 @@ namespace MacDeskNative {
    Backdrop bd = Wallpaper.Current;
    if (bd == null) return null;
    Point origin = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
-   if (wallpaperBrush == null || wallpaperSource != bd) {
+   Rectangle region = Rectangle.Inflate(Rectangle.Union(ClockCard, MonthCard), 4, 4);
+   region.Offset(origin);
+   region.Intersect(bd.Area);
+   if (region.Width <= 0 || region.Height <= 0) return null;
+   if (wallpaperBrush == null || wallpaperSource != bd || !wallpaperRegion.Contains(region)) {
     if (wallpaperBrush != null) wallpaperBrush.Dispose();
-    wallpaperBrush = new TextureBrush(bd.Image, WrapMode.Clamp);
+    wallpaperRegion = Rectangle.Intersect(Rectangle.Inflate(region, 96, 96), bd.Area);
+    wallpaperBrush = bd.CreateBrush(wallpaperRegion, origin);
     wallpaperSource = bd;
     wallpaperOrigin = new Point(int.MinValue, 0);
    }
    if (wallpaperOrigin != origin) {
     wallpaperBrush.ResetTransform();
-    wallpaperBrush.TranslateTransform(bd.Area.X - origin.X, bd.Area.Y - origin.Y);
+    wallpaperBrush.TranslateTransform(wallpaperRegion.X - origin.X, wallpaperRegion.Y - origin.Y);
     wallpaperOrigin = origin;
    }
    return wallpaperBrush;
@@ -259,12 +269,13 @@ namespace MacDeskNative {
   // Everything that does not change between animation frames is rendered once into a layer;
   // a hover / month-slide frame only copies layers and draws the one moving element.
   Bitmap cardsCache, clockCache, headerCache, gridCache, footerCache;
-  string cardsKey, clockKey, headerKey, gridKey, footerKey;
+  string footerKey;
+  Point cardsOrigin;
+  Backdrop cardsSource;
+  DateTime headerMonth, gridToday;
   readonly System.Drawing.Imaging.ImageAttributes blitAttributes = new System.Drawing.Imaging.ImageAttributes();
   readonly System.Drawing.Imaging.ColorMatrix blitMatrix = new System.Drawing.Imaging.ColorMatrix();
   static readonly Rectangle HeaderRegion = new Rectangle(16, 236, 250, 38);
-  static readonly Rectangle GridRegion = new Rectangle(GridLeft - 4, GridTop - 4, CellW * 7 + 8, CellH * 6 + 8);
-  static readonly Rectangle FooterRegion = new Rectangle(20, MonthCard.Bottom - 34, 312, 26);
 
   static Bitmap Layer(Rectangle region, out Graphics g) {
    var bmp = new Bitmap(Math.Max(1, region.Width), Math.Max(1, region.Height), System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
@@ -276,13 +287,13 @@ namespace MacDeskNative {
   }
   static void Replace(ref Bitmap cache, Bitmap next) { if (cache != null) cache.Dispose(); cache = next; }
 
-  void DrawCard(Graphics g, Rectangle bounds, float lift) {
+  void DrawCard(Graphics g, Rectangle bounds) {
    var r = new RectangleF(bounds.X, bounds.Y, bounds.Width, bounds.Height);
    for (int i = 0; i < 3; i++) {
-    float spread = 2f + i * 3f + lift * 4f;
-    var s = new RectangleF(r.X - spread * 0.5f, r.Y + 3f + lift * 5f, r.Width + spread, r.Height + spread * 0.6f);
+    float spread = 2f + i * 3f;
+    var s = new RectangleF(r.X - spread * 0.5f, r.Y + 3f, r.Width + spread, r.Height + spread * 0.6f);
     using (var path = Ui.Squircle(s, CardRadius + spread * 0.5f))
-    using (var b = new SolidBrush(Color.FromArgb((int)(14 - i * 3 + lift * 8), 0, 0, 0))) g.FillPath(b, path);
+    using (var b = new SolidBrush(Color.FromArgb(14 - i * 3, 0, 0, 0))) g.FillPath(b, path);
    }
    using (var shape = Ui.Squircle(r, CardRadius)) Material.Fill(g, shape, WallpaperBrush(), Material.WidgetTint, Material.WidgetFallback);
    Material.Rim(g, r, CardRadius, 0.7f);
@@ -290,23 +301,23 @@ namespace MacDeskNative {
 
   static readonly string[] WeekLetters = { "日", "一", "二", "三", "四", "五", "六" };
   void DrawStaticCards(Graphics g) {
-   DrawCard(g, ClockCard, dragLift.F);
-   DrawCard(g, MonthCard, dragLift.F);
+   DrawCard(g, ClockCard);
+   DrawCard(g, MonthCard);
    using (var f = Ui.Centered(false))
     for (int c = 0; c < 7; c++)
      using (var b = new SolidBrush(c == 0 || c == 6 ? Ui.TertiaryLabel : Ui.SecondaryLabel))
-      g.DrawString(WeekLetters[c], weekdayFont, b, new RectangleF(GridLeft + c * CellW, 280, CellW, 22), f);
+      TextStyle.Draw(g, WeekLetters[c], Ui.Cjk, FontStyle.Bold, 12f, b.Color, new RectangleF(GridLeft + c * CellW, 280, CellW, 22), f, 0f);
   }
 
   void DrawCards(Graphics g) {
-   if (dragLift.Value > 0.01) { DrawStaticCards(g); return; } // live only while the widget is carried
    Backdrop bd = Wallpaper.Current;
-   string key = (IsHandleCreated ? PointToScreen(Point.Empty) : Location) + "|" + (bd == null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(bd));
-   if (cardsCache == null || cardsKey != key) {
+   Point origin = PointToScreen(Point.Empty);
+   if (cardsCache == null || cardsCache.Size != Size || cardsOrigin != origin || cardsSource != bd) {
     Graphics cg;
     Replace(ref cardsCache, Layer(new Rectangle(Point.Empty, Size), out cg));
     using (cg) DrawStaticCards(cg);
-    cardsKey = key;
+    cardsOrigin = origin;
+    cardsSource = bd;
    }
    var mode = g.CompositingMode;
    g.CompositingMode = CompositingMode.SourceCopy;
@@ -315,70 +326,39 @@ namespace MacDeskNative {
   }
 
   void Render() {
-   if (IsDisposed || Disposing || rendering || !IsHandleCreated || Width < 1 || Height < 1) return;
+   if (IsDisposed || Disposing || rendering || draggingCard || !IsHandleCreated || Width < 1 || Height < 1) return;
    rendering = true;
    try {
+    DateTime utc = DateTime.UtcNow, now = BeijingFromUtc(utc);
+    long minute = utc.Ticks / TimeSpan.TicksPerMinute;
+    DateTime month = DisplayedMonth(now);
+    UpdateCalendarLayout(month);
     var g = surface.Begin(Size);
-    surface.Clear(new Rectangle(Point.Empty, Size));
     Ui.PrepareQuality(g);
-    DateTime now = BeijingFromUtc(DateTime.UtcNow);
     DrawCards(g);
-    DrawClock(g, now);
-    DrawCalendar(g, now);
+    DrawClock(g, now, minute != renderedMinute);
+    DrawCalendar(g, now.Date, month);
     surface.Present(Handle, DesktopChildMode ? (Point?)null : Location, 255, null);
+    renderedMinute = minute;
    } finally { rendering = false; }
-   EnsureZOrder();
   }
 
   static readonly string[] WeekNames = { "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六" };
   static readonly string[] MonthNames = { "一月", "二月", "三月", "四月", "五月", "六月", "七月", "八月", "九月", "十月", "十一月", "十二月" };
 
-  void DrawClock(Graphics g, DateTime now) {
-   string time = now.ToString("HH:mm"), sub;
-   Color subColor;
-   if (focusRunning) {
-    TimeSpan rem = focusEndUtc - DateTime.UtcNow;
-    if (rem.TotalSeconds < 0) rem = TimeSpan.Zero;
-    sub = String.Format("专注中 · 剩余 {0:00}:{1:00}", (int)rem.TotalMinutes, rem.Seconds);
-    subColor = Ui.Orange;
-   } else {
-    sub = now.Month + "月" + now.Day + "日 " + WeekNames[(int)now.DayOfWeek];
-    subColor = Ui.SecondaryLabel;
-   }
-   string key = time + "|" + sub;
-   if (clockCache == null || clockKey != key) {
+  void DrawClock(Graphics g, DateTime now, bool minuteChanged) {
+   if (clockCache == null || minuteChanged) {
+    string time = now.ToString("HH:mm");
+    string date = now.Month + "月" + now.Day + "日 " + WeekNames[(int)now.DayOfWeek];
     Graphics cg;
     Replace(ref clockCache, Layer(ClockCard, out cg));
     using (cg) using (var lead = Ui.Leading()) {
-     using (var b = new SolidBrush(Ui.SecondaryLabel)) cg.DrawString("北京时间", captionFont, b, new RectangleF(24, 22, 150, 28), lead);
-     using (var b = new SolidBrush(Ui.Label)) cg.DrawString(time, clockFont, b, new RectangleF(16, 50, 320, 100), lead);
-     using (var b = new SolidBrush(subColor)) cg.DrawString(sub, dateFont, b, new RectangleF(24, 156, 300, 28), lead);
+     TextStyle.Draw(cg, "北京时间", Ui.Cjk, FontStyle.Regular, 13.5f, Ui.SecondaryLabel, new RectangleF(24, 22, 150, 28), lead, 0.35f);
+     TextStyle.Draw(cg, time, Ui.DisplaySemibold, FontStyle.Regular, 74f, Ui.Label, new RectangleF(18, 52, 320, 100), lead, 0f);
+     TextStyle.Draw(cg, date, Ui.Cjk, FontStyle.Regular, 16f, Ui.SecondaryLabel, new RectangleF(24, 156, 300, 28), lead, 0.45f);
     }
-    clockKey = key;
    }
    Ui.Blit(g, clockCache, ClockCard.X, ClockCard.Y);
-   DrawFocusControl(g);
-  }
-
-  void DrawFocusControl(Graphics g) {
-   float hover = cardHover.F;
-   if (focusRunning) {
-    // Activity-ring style countdown in the top-right corner.
-    TimeSpan rem = focusEndUtc - DateTime.UtcNow;
-    float progress = (float)Math.Max(0.0, Math.Min(1.0, 1.0 - rem.TotalSeconds / FocusDurationSeconds));
-    var ring = new RectangleF(ClockCard.Right - 62, ClockCard.Y + 18, 42, 42);
-    using (var track = new Pen(Color.FromArgb(60, 255, 159, 10), 5f)) g.DrawEllipse(track, ring);
-    using (var arc = new Pen(Ui.Orange, 5f)) { arc.StartCap = arc.EndCap = LineCap.Round; g.DrawArc(arc, ring, -90, Math.Max(2f, 360f * progress)); }
-    using (var f = Ui.Centered(false)) using (var b = new SolidBrush(Ui.Label)) g.DrawString(Math.Max(0, (int)Math.Ceiling(rem.TotalMinutes)).ToString(), ringFont, b, ring, f);
-    return;
-   }
-   if (hover <= 0.01f) return;
-   float s = focusPress.F;
-   var r = Scale(FocusButton, s);
-   bool over = FocusButton.Contains(mouseClient);
-   using (var path = Ui.Squircle(r, r.Height / 2f))
-   using (var b = new SolidBrush(Color.FromArgb((int)((over ? 255 : 220) * hover), 255, 159, 10))) g.FillPath(b, path);
-   using (var f = Ui.Centered(false)) using (var b = new SolidBrush(Color.FromArgb((int)(255 * hover), 255, 255, 255))) g.DrawString("专注 25", pillFont, b, r, f);
   }
 
   static RectangleF Scale(Rectangle r, float s) {
@@ -388,69 +368,99 @@ namespace MacDeskNative {
 
   DateTime DisplayedMonth(DateTime today) { return new DateTime(today.Year, today.Month, 1).AddMonths(monthOffset); }
 
-  int HitCalendarDay(Point pt, DateTime month) {
-   if (!MonthCard.Contains(pt)) return -1;
-   int offset = (int)month.DayOfWeek, days = DateTime.DaysInMonth(month.Year, month.Month);
-   for (int d = 1; d <= days; d++) {
-    int cell = offset + d - 1;
-    if (new Rectangle(GridLeft + (cell % 7) * CellW, GridTop + (cell / 7) * CellH, CellW, CellH).Contains(pt)) return d;
+  static int CalendarRows(DateTime month) {
+   return ((int)month.DayOfWeek + DateTime.DaysInMonth(month.Year, month.Month) + 6) / 7;
+  }
+
+  internal static Rectangle CalendarCardBounds(DateTime month, bool hasNotes) {
+   int bottom = GridTop + CalendarRows(month) * CellH + CalendarBottomPadding + (hasNotes ? NoteHeight : 0);
+   return Rectangle.FromLTRB(4, MonthTop, 4 + CardWidth, bottom);
+  }
+
+  private void UpdateCalendarLayout(DateTime month) {
+   if (month == calendarMonth && app.Data == calendarData) return;
+   gridDirty |= month != calendarMonth;
+   calendarMonth = month;
+   calendarData = app.Data;
+   bool hasNotes = false;
+   int days = DateTime.DaysInMonth(month.Year, month.Month);
+   bool lookupNotes = calendarData.notes != null && calendarData.notes.Count > 0;
+   for (int day = 1; day <= days; day++) {
+    string note = null;
+    if (lookupNotes) calendarData.notes.TryGetValue(month.AddDays(day - 1).ToString("yyyy-MM-dd"), out note);
+    if (String.IsNullOrEmpty(note)) note = null;
+    gridDirty |= (monthNotes[day] != null) != (note != null);
+    monthNotes[day] = note;
+    hasNotes |= note != null;
    }
-   return -1;
+   Array.Clear(monthNotes, days + 1, monthNotes.Length - days - 1);
+   int gridHeight = CalendarRows(month) * CellH;
+   MonthCard = CalendarCardBounds(month, hasNotes);
+   GridRegion = new Rectangle(GridLeft - 4, GridTop - 4, CellW * 7 + 8, gridHeight + 6);
+   FooterRegion = new Rectangle(20, GridTop + gridHeight + 1, 312, NoteHeight);
+   int height = MonthCard.Bottom + 12;
+   if (Size != new Size(WidgetWidth, height)) {
+    bool grew = height > Height;
+    Size = new Size(WidgetWidth, height);
+    if (grew && Visible) FitCalendarOnScreen();
+   }
   }
 
-  string NoteFor(DateTime month, int day) {
-   string note = null;
-   if (app != null && app.Data != null && app.Data.notes != null) app.Data.notes.TryGetValue(new DateTime(month.Year, month.Month, day).ToString("yyyy-MM-dd"), out note);
-   return String.IsNullOrEmpty(note) ? null : note;
+  void FitCalendarOnScreen() {
+   Rectangle work = Screen.FromControl(this).WorkingArea;
+   int top = PointToScreen(Point.Empty).Y;
+   int limit = Math.Max(work.Top, work.Bottom - Height);
+   if (top > limit) Top -= top - limit;
   }
 
-  RectangleF DayCircle(DateTime month, int day) {
+  internal static int HitCalendarDay(Point pt, DateTime month) {
+   int x = pt.X - GridLeft, y = pt.Y - GridTop;
+   if (x < 0 || x >= 7 * CellW || y < 0 || y >= CalendarRows(month) * CellH) return -1;
+   int day = (y / CellH) * 7 + x / CellW - (int)month.DayOfWeek + 1;
+   return day >= 1 && day <= DateTime.DaysInMonth(month.Year, month.Month) ? day : -1;
+  }
+
+  internal static RectangleF DayCircle(DateTime month, int day) {
    int cell = (int)month.DayOfWeek + day - 1;
    return new RectangleF(GridLeft + (cell % 7) * CellW + (CellW - 30) / 2f, GridTop + (cell / 7) * CellH + 1, 30, 30);
   }
 
-  void DrawCalendar(Graphics g, DateTime now) {
-   DateTime today = now.Date;
-   DateTime month = DisplayedMonth(today);
+  void DrawCalendar(Graphics g, DateTime today, DateTime month) {
    float slide = monthSlide.F;
    float hover = monthHover.F;
    float headerAlpha = 0.35f + 0.65f * (1 - Math.Min(1f, Math.Abs(slide)));
    float gridAlpha = 1 - Math.Min(1f, Math.Abs(slide)) * 0.8f;
 
    // Header (month name in iOS red + year), cached per month.
-   string hk = month.ToString("yyyy-MM");
-   if (headerCache == null || headerKey != hk) {
+   if (headerCache == null || headerMonth != month) {
     Graphics cg;
     Replace(ref headerCache, Layer(HeaderRegion, out cg));
     using (cg) using (var lead = Ui.Leading()) {
      string name = MonthNames[month.Month - 1];
      var nameRect = new RectangleF(24, 238, 160, 34);
-     using (var b = new SolidBrush(Ui.Red)) cg.DrawString(name, monthFont, b, nameRect, lead);
-     float nameW = cg.MeasureString(name, monthFont).Width;
-     using (var b = new SolidBrush(Ui.SecondaryLabel)) cg.DrawString(month.Year.ToString(), yearFont, b, new RectangleF(nameRect.X + nameW - 2, 238, 80, 34), lead);
+     TextStyle.Draw(cg, name, Ui.Cjk, FontStyle.Bold, 16.5f, Ui.Red, nameRect, lead, 0f);
+     float nameW = TextStyle.Width(name, Ui.Cjk, FontStyle.Bold, 16.5f);
+     TextStyle.Draw(cg, month.Year.ToString(), Ui.TextRegular, FontStyle.Regular, 16f, Ui.SecondaryLabel, new RectangleF(nameRect.X + nameW + 6, 238, 80, 34), lead, 0.3f);
     }
-    headerKey = hk;
+    headerMonth = month;
    }
    Ui.Blit(g, headerCache, HeaderRegion.X + (int)Math.Round(slide * 24), HeaderRegion.Y, headerAlpha, blitAttributes, blitMatrix);
 
    if (hover > 0.01f || monthOffset != 0) {
     float vis = Math.Max(hover, monthOffset != 0 ? 1f : 0f);
-    DrawChevron(g, PrevMonth, "‹", vis, pressedTarget == 2 ? navPress.F : 1f);
-    DrawChevron(g, NextMonth, "›", vis, pressedTarget == 3 ? navPress.F : 1f);
+    DrawChevron(g, PrevMonth, "‹", vis, pressedTarget == CalendarTarget.PreviousMonth ? navPress.F : 1f);
+    DrawChevron(g, NextMonth, "›", vis, pressedTarget == CalendarTarget.NextMonth ? navPress.F : 1f);
     if (monthOffset != 0) {
      bool over = TodayButton.Contains(mouseClient);
      using (var path = Ui.Squircle(TodayButton, TodayButton.Height / 2f))
      using (var b = new SolidBrush(Color.FromArgb(over ? 70 : 44, 255, 255, 255))) g.FillPath(b, path);
-     using (var f = Ui.Centered(false)) using (var b = new SolidBrush(Ui.Red)) g.DrawString("今天", pillFont, b, TodayButton, f);
+     using (var f = Ui.Centered(false)) TextStyle.Draw(g, "今天", Ui.Cjk, FontStyle.Bold, 12.5f, Ui.Red, TodayButton, f, 0f);
     }
    }
 
    // Day grid (numbers, today's red disc, note dots), cached per month + notes.
    int days = DateTime.DaysInMonth(month.Year, month.Month);
-   var noteSig = new System.Text.StringBuilder(hk).Append('|').Append(today.ToString("yyyy-MM-dd"));
-   for (int d = 1; d <= days; d++) if (NoteFor(month, d) != null) noteSig.Append(',').Append(d);
-   string gk = noteSig.ToString();
-   if (gridCache == null || gridKey != gk) {
+   if (gridCache == null || gridDirty || gridToday != today) {
     Graphics cg;
     Replace(ref gridCache, Layer(GridRegion, out cg));
     using (cg) using (var f = Ui.Centered(false)) {
@@ -460,12 +470,13 @@ namespace MacDeskNative {
       bool isToday = month.Year == today.Year && month.Month == today.Month && d == today.Day;
       if (isToday) using (var b = new SolidBrush(Ui.Red)) cg.FillEllipse(b, circle);
       Color ink = isToday ? Color.White : (col == 0 || col == 6 ? Ui.SecondaryLabel : Ui.Label);
-      using (var b = new SolidBrush(ink)) cg.DrawString(d.ToString(), isToday ? dayBoldFont : dayFont, b, new RectangleF(circle.X - 4, circle.Y, circle.Width + 8, circle.Height), f);
-      if (NoteFor(month, d) != null)
+      TextStyle.Draw(cg, d.ToString(), isToday ? Ui.TextSemibold : Ui.TextRegular, FontStyle.Regular, 15.5f, ink, new RectangleF(circle.X - 4, circle.Y, circle.Width + 8, circle.Height), f, isToday ? 0f : 0.35f);
+      if (monthNotes[d] != null)
        using (var b = new SolidBrush(isToday ? Ui.Red : Ui.Orange)) cg.FillEllipse(b, circle.X + 15 - 2.5f, circle.Y + CellH - 5.5f, 5, 5);
      }
     }
-    gridKey = gk;
+    gridDirty = false;
+    gridToday = today;
    }
 
    var oldClip = g.Clip;
@@ -483,17 +494,15 @@ namespace MacDeskNative {
    g.Clip = oldClip;
    oldClip.Dispose();
 
-   string activeNote = hoveredDay > 0 && hoveredDay <= days ? NoteFor(month, hoveredDay) : null;
-   string todayNote = month.Year == today.Year && month.Month == today.Month ? NoteFor(month, today.Day) : null;
-   string footer = activeNote != null ? hoveredDay + "日 · " + activeNote : todayNote != null ? "今天 · " + todayNote : (hover > 0.5f ? "点日期写备忘 · 滚轮切换月份" : "");
+   string activeNote = hoveredDay > 0 && hoveredDay <= days ? monthNotes[hoveredDay] : null;
+   string todayNote = month.Year == today.Year && month.Month == today.Month ? monthNotes[today.Day] : null;
+   string footer = activeNote != null ? hoveredDay + "日 · " + activeNote : todayNote != null ? "今天 · " + todayNote : "";
    if (!String.IsNullOrEmpty(footer)) {
-    bool isNote = activeNote != null || todayNote != null;
-    string fk = (isNote ? "n" : "h") + footer;
-    if (footerCache == null || footerKey != fk) {
+    if (footerCache == null || footerKey != footer) {
      Graphics cg;
      Replace(ref footerCache, Layer(FooterRegion, out cg));
-     using (cg) using (var lead = Ui.Leading()) using (var b = new SolidBrush(isNote ? Ui.Orange : Ui.TertiaryLabel)) cg.DrawString(footer, noteFont, b, new RectangleF(24, MonthCard.Bottom - 32, 300, 22), lead);
-     footerKey = fk;
+     using (cg) using (var lead = Ui.Leading()) TextStyle.Draw(cg, footer, Ui.Cjk, FontStyle.Regular, 13f, Ui.Orange, new RectangleF(24, FooterRegion.Y, 300, 22), lead, 0.3f);
+     footerKey = footer;
     }
     Ui.Blit(g, footerCache, FooterRegion.X, FooterRegion.Y);
    }
@@ -508,22 +517,22 @@ namespace MacDeskNative {
   }
 
   protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Render(); }
+  protected override void OnShown(EventArgs e) { base.OnShown(e); FitCalendarOnScreen(); }
   protected override void OnPaint(PaintEventArgs e) { }
   protected override void OnPaintBackground(PaintEventArgs e) { }
 
   // --- Input ----------------------------------------------------------------------------
 
-  int TargetAt(Point pt, out int day) {
+  CalendarTarget TargetAt(Point pt, out int day) {
+   day = -1;
+   if (!MonthCard.Contains(pt)) return CalendarTarget.None;
    DateTime month = DisplayedMonth(BeijingFromUtc(DateTime.UtcNow).Date);
    day = HitCalendarDay(pt, month);
-   if (FocusButton.Contains(pt) && (cardHover.Value > 0.3 || focusRunning)) return 1;
-   if (focusRunning && new Rectangle(ClockCard.Right - 66, ClockCard.Y + 14, 50, 50).Contains(pt)) return 1;
    bool navVisible = monthHover.Value > 0.3 || monthOffset != 0;
-   if (navVisible && PrevMonth.Contains(pt)) return 2;
-   if (navVisible && NextMonth.Contains(pt)) return 3;
-   if (monthOffset != 0 && TodayButton.Contains(pt)) return 4;
-   if (day > 0) return 5;
-   return 0;
+   if (navVisible && PrevMonth.Contains(pt)) return CalendarTarget.PreviousMonth;
+   if (navVisible && NextMonth.Contains(pt)) return CalendarTarget.NextMonth;
+   if (monthOffset != 0 && TodayButton.Contains(pt)) return CalendarTarget.Today;
+   return day > 0 ? CalendarTarget.Day : CalendarTarget.None;
   }
 
   protected override void OnMouseDown(MouseEventArgs e) {
@@ -531,10 +540,10 @@ namespace MacDeskNative {
    if (e.Button != MouseButtons.Left) return;
    int day;
    pressedTarget = TargetAt(e.Location, out day);
-   if (pressedTarget == 0 && HitsCard(e.Location)) {
+   if (pressedTarget == CalendarTarget.None && HitsCard(e.Location)) {
     draggingCard = true;
     dragDownScreen = PointToScreen(e.Location);
-    dragOrigLoc = Location;
+    dragOrigLoc = dragTargetLocation = Location;
     Capture = true;
     Cursor = Cursors.SizeAll;
    }
@@ -544,24 +553,53 @@ namespace MacDeskNative {
   protected override void OnMouseMove(MouseEventArgs e) {
    base.OnMouseMove(e);
    if (draggingCard && e.Button == MouseButtons.Left) {
-    Point cur = PointToScreen(e.Location);
-    Location = new Point(dragOrigLoc.X + cur.X - dragDownScreen.X, dragOrigLoc.Y + cur.Y - dragDownScreen.Y);
+    UpdateDragTarget(PointToScreen(e.Location));
     Wake();
     return;
    }
+   Point previous = mouseClient;
    mouseClient = e.Location;
    int day;
-   int target = TargetAt(e.Location, out day);
+   CalendarTarget target = TargetAt(e.Location, out day);
+   bool changed = hoveredDay != day || MonthCard.Contains(previous) != MonthCard.Contains(mouseClient) ||
+    PrevMonth.Contains(previous) != PrevMonth.Contains(mouseClient) || NextMonth.Contains(previous) != NextMonth.Contains(mouseClient) ||
+    TodayButton.Contains(previous) != TodayButton.Contains(mouseClient);
    hoveredDay = day;
-   Cursor = target != 0 ? Cursors.Hand : Cursors.Default;
+   Cursor = target != CalendarTarget.None ? Cursors.Hand : Cursors.Default;
+   if (changed) Wake();
+  }
+
+  void UpdateDragTarget(Point screen) {
+   dragTargetLocation = new Point(dragOrigLoc.X + screen.X - dragDownScreen.X, dragOrigLoc.Y + screen.Y - dragDownScreen.Y);
+  }
+
+  void ApplyDragTarget() {
+   // DWM can move the existing layered bitmap without asking us to paint it again.
+   if (Location != dragTargetLocation) Location = dragTargetLocation;
+  }
+
+  void FinishDrag(Point? releaseScreen) {
+   ApplyDragTarget();
+   draggingCard = false;
+   Capture = false;
+   Cursor = Cursors.Default;
+   if (Location != dragOrigLoc) app.SetHomePosition(Left, Top);
+   mouseClient = releaseScreen.HasValue ? PointToClient(releaseScreen.Value) : new Point(-999, -999);
+   TargetAt(mouseClient, out hoveredDay);
    Wake();
+  }
+
+  protected override void OnMouseCaptureChanged(EventArgs e) {
+   base.OnMouseCaptureChanged(e);
+   if (draggingCard && !Capture && !Disposing && !IsDisposed) FinishDrag(null);
   }
 
   protected override void OnMouseLeave(EventArgs e) {
    base.OnMouseLeave(e);
+   if (draggingCard) return;
    mouseClient = new Point(-999, -999);
    hoveredDay = -1;
-   pressedTarget = 0;
+   pressedTarget = CalendarTarget.None;
    Cursor = Cursors.Default;
    Wake();
   }
@@ -573,26 +611,23 @@ namespace MacDeskNative {
 
   protected override void OnMouseUp(MouseEventArgs e) {
    base.OnMouseUp(e);
-   int pressed = pressedTarget;
-   pressedTarget = 0;
-   Wake();
-   if (draggingCard) {
-    draggingCard = false;
-    Capture = false;
-    Cursor = Cursors.Default;
-    app.SetHomePosition(Left, Top);
-    if (app.DesktopFolders != null) app.DesktopFolders.RefreshData();
+   CalendarTarget pressed = pressedTarget;
+   pressedTarget = CalendarTarget.None;
+   if (draggingCard && e.Button == MouseButtons.Left) {
+    Point release = PointToScreen(e.Location);
+    UpdateDragTarget(release);
+    FinishDrag(release);
     return;
    }
+   Wake();
    if (e.Button != MouseButtons.Left) return;
    int day;
-   int target = TargetAt(e.Location, out day);
+   CalendarTarget target = TargetAt(e.Location, out day);
    if (target != pressed) return;
-   if (target == 1) { ToggleFocusTimer(); return; }
-   if (target == 2) { ChangeMonth(-1); return; }
-   if (target == 3) { ChangeMonth(1); return; }
-   if (target == 4) { ChangeMonth(-monthOffset); return; }
-   if (target == 5 && day > 0) {
+   if (target == CalendarTarget.PreviousMonth) { ChangeMonth(-1); return; }
+   if (target == CalendarTarget.NextMonth) { ChangeMonth(1); return; }
+   if (target == CalendarTarget.Today) { ChangeMonth(-monthOffset); return; }
+   if (target == CalendarTarget.Day) {
     DateTime month = DisplayedMonth(BeijingFromUtc(DateTime.UtcNow).Date);
     string dateKey = new DateTime(month.Year, month.Month, day).ToString("yyyy-MM-dd");
     Point screenPos = PointToScreen(new Point(MonthCard.Left, MonthCard.Bottom - 80));
@@ -600,7 +635,7 @@ namespace MacDeskNative {
    }
   }
 
-  protected override void OnLocationChanged(EventArgs e) { base.OnLocationChanged(e); if (IsHandleCreated && !rendering) Render(); }
+  protected override void OnLocationChanged(EventArgs e) { base.OnLocationChanged(e); if (IsHandleCreated && !draggingCard) Render(); }
 
   protected override void Dispose(bool disposing) {
    if (disposing) {
@@ -609,9 +644,7 @@ namespace MacDeskNative {
     timer.Dispose();
     surface.Dispose();
     if (wallpaperBrush != null) { wallpaperBrush.Dispose(); wallpaperBrush = null; }
-    captionFont.Dispose(); clockFont.Dispose(); dateFont.Dispose(); pillFont.Dispose(); ringFont.Dispose();
-    monthFont.Dispose(); yearFont.Dispose(); weekdayFont.Dispose(); dayFont.Dispose(); dayBoldFont.Dispose();
-    noteFont.Dispose(); chevronFont.Dispose();
+    chevronFont.Dispose();
     blitAttributes.Dispose();
     foreach (var c in new[] { cardsCache, clockCache, headerCache, gridCache, footerCache }) if (c != null) c.Dispose();
     if (ContextMenuStrip != null) ContextMenuStrip.Dispose();

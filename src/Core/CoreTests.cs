@@ -63,6 +63,17 @@ namespace MacDesk.Core {
    Check(svc.GetGroup("two").desktopX == 500 && svc.GetGroup("two").desktopY == 300, "pin folder position");
    svc.ResetGroupPositions();
    Check(svc.GetGroup("two").desktopX == -1, "reset positions");
+   // Pinned layout -> order. List is [two, one]; pin "one" left of "two" on the same row.
+   svc.SetGroupPosition("one", 300, 30, null, new Size(1920, 1080));
+   svc.SetGroupPosition("two", 700, 24, null, new Size(1920, 1080));
+   Check(svc.MigratePinnedPositionsToOrder() && svc.Data.groups[0].id == "one" && svc.Data.groups[1].id == "two" && svc.Data.groups[0].desktopX == -1, "pinned positions migrate to reading order");
+   Check(!svc.MigratePinnedPositionsToOrder(), "migration runs once");
+   svc.MoveGroup("two", 0); // restore [two, one] for the checks below
+   int before = changes;
+   var batch = new System.Collections.Generic.Dictionary<string, Point> { { "one", new Point(700, 24) }, { "two", new Point(832, 24) } };
+   svc.SetGroupPositions(batch, null, new Size(1920, 1080));
+   Check(changes == before + 1 && svc.GetGroup("one").desktopX == 700 && svc.GetGroup("two").desktopX == 832, "batch positions save atomically");
+   svc.ResetGroupPositions();
 
    var fresh = new DesktopStore(root);
    Check(fresh.Data.groups[0].items[0].id == first, "restart persistence");
@@ -71,7 +82,16 @@ namespace MacDesk.Core {
    var old = fresh.Data.groups[0].title;
    try { fresh.Edit(d => { d.groups[0].title = ""; }); throw new Exception("Invalid title accepted"); } catch (InvalidDataException) { }
    Check(fresh.Data.groups[0].title == old, "validation rollback");
-   try { fresh.Edit(d => { d.notes["bad-date"] = "x"; }); throw new Exception("Invalid date key accepted"); } catch (InvalidDataException) { }
+   var beforeFailure = fresh.Data;
+   try {
+    fresh.Edit(d => { d.groups[0].items[0].title = "discard"; d.notes["bad-date"] = "x"; });
+    throw new Exception("Invalid date key accepted");
+   } catch (InvalidDataException) { }
+   Check(fresh.Data == beforeFailure && fresh.Data.groups[0].items[0].title == "新名字" &&
+    !fresh.Data.notes.ContainsKey("bad-date"), "failed edit cannot modify published items or notes");
+   fresh.Edit(d => { d.groups[0].items[0].title = "保留"; d.notes["2026-11-22"] = "已更新"; });
+   Check(beforeFailure.groups[0].items[0].title == "新名字" && beforeFailure.notes["2026-11-22"] == "里程碑检查",
+    "successful edit leaves older snapshots intact");
 
    string seedRoot = Path.Combine(root, "seed");
    Directory.CreateDirectory(seedRoot);

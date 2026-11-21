@@ -80,9 +80,19 @@ namespace MacDesk.Core {
    lock (gate) {
     Image result;
     if (cache.TryGetValue(key, out result)) return result;
-    try { if (File.Exists(custom)) { using (var source = Image.FromFile(custom)) result = new Bitmap(source); } } catch { }
-    if (result == null && item.type != "url") result = ShellIcon(target);
-    if (result == null) {
+    result = Load(item);
+    cache[key] = result;
+    return result;
+   }
+  }
+
+  // The renderer owns this image and releases it after building its smaller cached copy.
+  internal static Image Load(DeskItem item) {
+   Image result = null;
+   string custom = item.icon ?? "";
+   try { if (File.Exists(custom)) { using (var source = Image.FromFile(custom)) result = new Bitmap(source); } } catch { }
+   if (result == null && item.type != "url") result = ShellIcon(item.target ?? "");
+   if (result == null) {
      string name = item.type == "url" ? "Browser" : item.type == "app" ? "Terminal" : "Explorer";
      string asset = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MacDesk", "Rainmeter", "Skins", "MacDesk", "@Resources", "Icons", name + ".png");
      try { using (var source = Image.FromFile(asset)) result = new Bitmap(source); } catch { }
@@ -107,9 +117,7 @@ namespace MacDesk.Core {
      }
      result = b;
     }
-    cache[key] = result;
-    return result;
-   }
+   return result;
   }
 
   static GraphicsPath RoundedRect(Rectangle r, int radius) {

@@ -5,6 +5,7 @@ using System.IO;
 using System.Diagnostics;
 using System.Drawing;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
 using MacDesk.Core;
@@ -18,94 +19,16 @@ namespace MacDeskNative {
   public DesktopFolderForm DesktopFolders { get; private set; }
   public bool ModalInProgress { get { return modalDepth > 0; } }
   int modalDepth;
-  public PanelForm Panel { get; private set; }
-  readonly Dictionary<string, PanelForm> panels = new Dictionary<string, PanelForm>();
+  public FolderLayer Panel { get; private set; }
 
-  // Windows 11 coalesces every timer to ~15.6 ms; the folder morph is rendered by its own
-  // thread paced by DwmFlush, i.e. one frame per display refresh (240 Hz on this machine).
-  Thread renderThread;
-  volatile bool motionRunning, reverseRequested;
-  // Each motion gets a generation so a completion queued by an older render thread can
-  // never finish (or tear down) a newer animation that started in the meantime.
-  int motionGeneration;
-  void StartMotion() {
-   StopMotion();
-   motionRunning = true;
-   reverseRequested = false;
-   clock.Restart();
-   MotionLogReset();
-   int generation = ++motionGeneration;
-   renderThread = new Thread(() => RenderLoop(generation));
-   renderThread.IsBackground = true;
-   renderThread.Priority = ThreadPriority.AboveNormal;
-   renderThread.Start();
-  }
-  void StopMotion() {
-   motionRunning = false;
-   Thread t = renderThread;
-   // The render thread only ever blocks for one frame; wait for it so the motion window is
-   // never disposed while a frame is still being presented on it.
-   if (t != null && t != Thread.CurrentThread && t.IsAlive) t.Join(2000);
-   renderThread = null;
-  }
-
-  readonly Stopwatch clock = new Stopwatch();
   NotifyIcon tray;
   bool closing, refreshQueued, testMode;
-  Rectangle originBounds, fromBounds, toBounds, expandedBounds, motionBounds;
-  double progressFrom, progressTo, motionProgress;
-  bool closeMotion, motionMouse, handingOff;
-  GlassMotion motion;
   BackdropOverlay dim;
   Backdrop backdrop;
-  const int OpenMs = 380, CloseMs = 300;
-  const double DimAlpha = 1.0;
-  // iOS-like springs: opening has a hint of overshoot, closing is critically damped.
-  const double OpenResponse = 0.36, OpenDamping = 0.8, CloseResponse = 0.30, CloseDamping = 1.0;
 
-  public static double EvaluateSpring(double t, bool closingMotion) {
-   if (t <= 0.0) return 0.0;
-   if (t >= 1.0) return 1.0;
-   double duration = (closingMotion ? CloseMs : OpenMs) / 1000.0;
-   double response = closingMotion ? CloseResponse : OpenResponse, damping = closingMotion ? CloseDamping : OpenDamping;
-   // Normalised so the curve lands exactly on 1 at the end of the motion (no visible snap).
-   return Spring.StepResponse(t * duration, response, damping) / Spring.StepResponse(duration, response, damping);
-  }
-
-  // Optional motion diagnostics (off unless MACDESK_MOTION_LOG is set): proves real frame pacing.
-  static readonly string MotionLog = Environment.GetEnvironmentVariable("MACDESK_MOTION_LOG");
-  long motionStartTicks, firstFrameTicks;
-  int motionFrames;
-  double motionMaxGapMs, lastFrameMs, workMax, workSum, setupMs;
-  void MotionLogReset() { motionStartTicks = Stopwatch.GetTimestamp(); firstFrameTicks = 0; motionFrames = 0; motionMaxGapMs = 0; lastFrameMs = 0; workMax = 0; workSum = 0; }
-  void MotionLogFrame(double workMs) {
-   if (workMs > workMax) workMax = workMs;
-   workSum += workMs;
-   long ms = (long)((Stopwatch.GetTimestamp() - motionStartTicks) * 1000.0 / Stopwatch.Frequency);
-   if (firstFrameTicks == 0) firstFrameTicks = ms;
-   if (lastFrameMs > 0) trackGap(ms - lastFrameMs);
-   lastFrameMs = ms;
-   motionFrames++;
-  }
-  void trackGap(double gap) { if (gap > motionMaxGapMs) motionMaxGapMs = gap; }
-  void MotionLogDone(bool isClosing) {
-   if (String.IsNullOrEmpty(MotionLog)) return;
-   try {
-    string phases = "";
-    GlassMotion m = motion;
-    if (m != null && motionFrames > 0) {
-     int n = motionFrames;
-     phases = ",\"materialMs\":" + Math.Round(m.TimeMaterial / n, 2) + ",\"contentMs\":" + Math.Round(m.TimeContent / n, 2) + ",\"originRimMs\":" + Math.Round(m.TimeOrigin / n, 2) + ",\"presentMs\":" + Math.Round(m.TimePresent / n, 2);
-    }
-    string line = "{\"closing\":" + (isClosing ? "true" : "false") + ",\"frames\":" + motionFrames + ",\"firstFrameMs\":" + firstFrameTicks + ",\"maxGapMs\":" + Math.Round(motionMaxGapMs, 1) + ",\"workAvgMs\":" + Math.Round(workSum / Math.Max(1, motionFrames), 2) + ",\"workMaxMs\":" + Math.Round(workMax, 2) + ",\"setupMs\":" + Math.Round(setupMs, 1) + phases + "}\r\n";
-    File.AppendAllText(MotionLog, line);
-   } catch { }
-  }
-
-  // Capturing + blurring the screen costs a few dozen ms; doing it while the mouse button is
-  // still down (a click lasts ~100 ms) means the folder starts moving the instant it's released.
-  // The work runs on a pool thread so the press animation itself never stalls.
-  System.Threading.Tasks.Task<Backdrop> prefetch;
+  // Copy the desktop before the panel exists. A worker prepares its blur independently of the
+  // click; opening can present immediately even if the worker is still running.
+  Task<Backdrop> prefetch;
   Rectangle prefetchArea;
   DateTime prefetchedAt;
   internal void PrefetchBackdrop(Point screenPoint) {
@@ -114,39 +37,62 @@ namespace MacDeskNative {
    DiscardPrefetch();
    prefetchArea = work;
    prefetchedAt = DateTime.UtcNow;
-   prefetch = System.Threading.Tasks.Task.Factory.StartNew(() => Backdrop.FromScreen(work));
+   prefetch = StartBackdrop(work);
   }
-  Backdrop TakePrefetch(Rectangle area) {
+  static Task<Backdrop> StartBackdrop(Rectangle area) {
+   Bitmap shot;
+   try { shot = Backdrop.CaptureScreen(area); } catch { return null; }
+   try { return Task.Factory.StartNew(() => { using (shot) return Backdrop.FromCapture(shot, area); }, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default); }
+   catch { shot.Dispose(); return null; }
+  }
+  Task<Backdrop> TakePrefetch(Rectangle area) {
    var task = prefetch;
    prefetch = null;
    if (task == null) return null;
-   if (prefetchArea == area && (DateTime.UtcNow - prefetchedAt).TotalMilliseconds < 2500) {
-    try { if (task.Wait(400)) return task.Result; } catch { }
-   }
+   if (prefetchArea == area && (DateTime.UtcNow - prefetchedAt).TotalMilliseconds < 2500) return task;
    DisposeWhenDone(task);
    return null;
   }
-  void DiscardPrefetch() { var task = prefetch; prefetch = null; if (task != null) DisposeWhenDone(task); }
-  static void DisposeWhenDone(System.Threading.Tasks.Task<Backdrop> task) {
-   task.ContinueWith(t => { if (t.Status == System.Threading.Tasks.TaskStatus.RanToCompletion && t.Result != null) t.Result.Dispose(); });
+  internal void DiscardPrefetch() { var task = prefetch; prefetch = null; if (task != null) DisposeWhenDone(task); }
+  static Backdrop CompletedBackdrop(Task<Backdrop> task) {
+   if (task.Status == TaskStatus.RanToCompletion) return task.Result;
+   if (task.IsFaulted) task.Exception.Handle(delegate { return true; });
+   return null;
+  }
+  static void DisposeWhenDone(Task<Backdrop> task) {
+   task.ContinueWith(t => { var image = CompletedBackdrop(t); if (image != null) image.Dispose(); }, TaskScheduler.Default);
   }
 
   // Blurred, dimmed copy of the screen behind an open folder. Captured once per open, before
   // any of our overlay windows exist, and reused while switching between folders.
-  void ShowDim(Rectangle bounds, double alpha) {
+  void ShowDim(Rectangle bounds) {
+   if (dim != null && !dim.IsDisposed && dim.Bounds != bounds) HideDim();
    if (dim == null || dim.IsDisposed) {
-    if (backdrop == null || backdrop.Area != bounds) {
-     if (backdrop != null) backdrop.Dispose();
-     backdrop = null;
-     backdrop = TakePrefetch(bounds);
-     if (backdrop == null) {
-      try { backdrop = Backdrop.FromScreen(bounds); } catch { backdrop = null; }
-     }
-    }
-    dim = new BackdropOverlay(bounds, OwnDialogWindow(), backdrop, delegate { ClosePanel(); });
+    var task = TakePrefetch(bounds) ?? StartBackdrop(bounds);
+    bool ready = task == null || task.IsCompleted;
+    backdrop = task != null && ready ? CompletedBackdrop(task) : null;
+    try { dim = new BackdropOverlay(bounds, OwnDialogWindow(), backdrop, !ready, delegate { ClosePanel(); }); }
+    catch { if (!ready) DisposeWhenDone(task); throw; }
+    if (!ready) FinishBackdrop(task, dim);
    }
    if (!dim.Visible) dim.Show();
-   dim.SetAlphaThreadSafe(alpha);
+   dim.SetAlpha(0);
+  }
+  void FinishBackdrop(Task<Backdrop> task, BackdropOverlay overlay) {
+   task.ContinueWith(t => {
+    var image = CompletedBackdrop(t);
+    try {
+     if (closing || dim != overlay || overlay.IsDisposed) return;
+     overlay.FinishPreparing(image);
+     // The desktop can fade in the blur at any time. Keep the pane's own glass stable once
+     // the morph is underway.
+     if (image != null && Panel != null && Panel.CanSetOpeningBackdrop) Panel.SetBackdrop(image);
+     backdrop = image;
+    } catch {
+     if (Panel != null && !Panel.IsDisposed) Panel.SetBackdrop(null);
+     if (dim == overlay && !overlay.IsDisposed) overlay.FinishPreparing(null);
+    } finally { if (image != null && backdrop != image) image.Dispose(); }
+   }, TaskScheduler.FromCurrentSynchronizationContext());
   }
   void HideDim() {
    BackdropOverlay old = dim;
@@ -154,7 +100,7 @@ namespace MacDeskNative {
    if (old != null) { old.Hide(); old.Dispose(); }
    if (backdrop != null) { backdrop.Dispose(); backdrop = null; }
    if (Panel != null && !Panel.IsDisposed) Panel.SetBackdrop(null);
-   if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.ReleaseKeyboardFocus();
+   if (DesktopFolders != null && !DesktopFolders.IsDisposed) { DesktopFolders.SetOpenFolder(null); DesktopFolders.ReleaseKeyboardFocus(); }
   }
 
   // The folder UI never takes activation (that would kick Windows out of "show desktop" and
@@ -163,22 +109,16 @@ namespace MacDeskNative {
   internal bool RouteKey(Keys key) {
    Keys code = key & Keys.KeyCode;
    bool modifierOnly = code == Keys.ShiftKey || code == Keys.ControlKey || code == Keys.Menu || code == Keys.LWin || code == Keys.RWin;
-   if (motion != null) {
-    if (closeMotion) return key == Keys.Escape;
-    if (MotionKey(key)) return true;
-    if (modifierOnly) return false;
-    FinishMotion(); // typing during the open: land the panel, then deliver the key
-   }
-   if (Panel != null && !Panel.IsDisposed && Panel.Visible) return Panel.HandleKey(key);
-   return false;
+   if (Panel == null || Panel.IsDisposed || !Panel.Visible) return false;
+   if (Panel.IsClosing) return key == Keys.Escape;
+   if (key == Keys.Escape && Panel.IsOpening) { ClosePanel(); return true; }
+   if (!modifierOnly) Panel.CompleteOpening(); // typing during the open: land it, then deliver
+   return Panel.HandleKey(key);
   }
   internal bool RouteChar(char c) {
-   if (motion != null) {
-    if (closeMotion) return false;
-    FinishMotion();
-   }
-   if (Panel != null && !Panel.IsDisposed && Panel.Visible) return Panel.HandleChar(c);
-   return false;
+   if (Panel == null || Panel.IsDisposed || !Panel.Visible || Panel.IsClosing) return false;
+   Panel.CompleteOpening();
+   return Panel.HandleChar(c);
   }
 
   [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
@@ -187,67 +127,6 @@ namespace MacDeskNative {
   }
 
   [System.Runtime.InteropServices.DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
-  void DisposeMotion() { GlassMotion old = motion; motion = null; if (old != null) old.Dispose(); }
-  [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-
-  bool MotionKey(Keys key) {
-   if (key == Keys.Escape) { ClosePanel(); return true; }
-   if (key == (Keys.Control | Keys.F)) {
-    FinishMotion();
-    if (Panel != null && !Panel.IsDisposed && Panel.Visible) Panel.FocusSearch();
-    return true;
-   }
-   return false;
-  }
-  internal bool SourceContains(Point point) { Rectangle r = originBounds; r.Inflate(16, 16); r.Height += 24; return r.Contains(point); }
-
-  void MotionDeactivated(object sender, EventArgs args) {
-   if (handingOff || motion == null || sender != motion || closing) return;
-   if ((GetAsyncKeyState(1) & 0x8000) != 0 || (GetAsyncKeyState(2) & 0x8000) != 0) return;
-   StopMotion();
-   if (Panel != null && !Panel.IsDisposed) Panel.Hide();
-   HideDim();
-   closeMotion = true;
-   DisposeMotion();
-  }
-  void PrepareMotion() {
-   motion.KeyHandler = MotionKey;
-   motion.Deactivate += MotionDeactivated;
-   // A click that lands while the folder is still opening is not lost: land the panel at
-   // once and deliver the click to whatever icon is under the pointer.
-   motion.Clicked = delegate(Point screen) {
-    if (closeMotion || motion == null) return;
-    FinishMotion();
-    if (Panel != null && !Panel.IsDisposed && Panel.Visible) Panel.ClickAt(Panel.PointToClient(screen));
-   };
-  }
-  void FinishMotion() {
-   StopMotion();
-   if (motion == null) return;
-   MotionLogDone(closeMotion);
-   handingOff = true;
-   try {
-    if (closeMotion) HideDim();
-    else if (dim != null && !dim.IsDisposed) dim.SetAlphaThreadSafe(DimAlpha);
-    if (Panel != null && !Panel.IsDisposed) {
-     if (closeMotion) Panel.Hide();
-     else {
-      // Present the real panel first, then drop the motion layer on top of it: the two
-      // frames are identical, so the hand-off is invisible.
-      Panel.Bounds = expandedBounds;
-      Panel.SetBackdrop(backdrop);
-      Panel.PresentNow();
-      Panel.Show(OwnDialogWindow());
-      BringToTop(Panel);
-      Panel.BeginReveal();
-     }
-    }
-    DisposeMotion();
-   } finally {
-    handingOff = false;
-   }
-  }
-
   public AppController(string root) : this(root, true, true) { }
   public AppController(string root, bool show) : this(root, show, false) { }
   internal AppController(string root, bool show, bool seedIfEmpty) {
@@ -256,6 +135,9 @@ namespace MacDeskNative {
     Service = new DeskService(root);
     Service.Changed += delegate { QueueRefresh(); };
     if (seedIfEmpty) Service.SeedStarterGroupsIfNew();
+    // Desktop folders are laid out by order on a fixed grid (like a phone home screen);
+    // turn any free positions saved by older versions into that order, once.
+    try { Service.MigratePinnedPositionsToOrder(); } catch { }
     Home = new HomeForm(this);
     Home.Text = "MacDesk Desktop";
     Home.FormClosed += delegate { Quit(); };
@@ -271,9 +153,7 @@ namespace MacDeskNative {
      NativeDesktop.Lower(Home.Handle);
      NativeDesktopHost.EnsureChildTopOrder(Home.Handle, DesktopFolders.Handle);
      CreateTray();
-     EventHandler warm = null;
-     warm = delegate { Application.Idle -= warm; WarmPanels(); };
-     Application.Idle += warm;
+     ThreadPool.QueueUserWorkItem(delegate { try { EntryServices.DiscoverSystemApps(); } catch { } });
     }
    } catch { Quit(); throw; }
   }
@@ -298,7 +178,7 @@ namespace MacDeskNative {
    return dialogOwner;
   }
   IWin32Window Owner() {
-   if (Panel != null && !Panel.IsDisposed && Panel.Visible && !closeMotion) return Panel;
+   if (Panel != null && !Panel.IsDisposed && Panel.Visible && !Panel.IsClosing) return Panel;
    if (Home == null || Home.IsDisposed || HostedHome) return OwnDialogWindow();
    return Home;
   }
@@ -330,7 +210,7 @@ namespace MacDeskNative {
   }
 
   T Modal<T>(Func<IWin32Window, T> action) {
-   FinishMotion();
+   if (Panel != null && !Panel.IsDisposed) Panel.CompleteOpening();
    bool hasHome = Home != null && !Home.IsDisposed;
    bool hosted = hasHome && Home.DesktopChildMode, enabled = hasHome && Home.Enabled, foldersEnabled = DesktopFolders != null && !DesktopFolders.IsDisposed && DesktopFolders.Enabled;
    modalDepth++;
@@ -357,169 +237,48 @@ namespace MacDeskNative {
     if (closing || Home == null || Home.IsDisposed) return;
     Home.RefreshData();
     if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.RefreshData();
-    foreach (var pair in panels.ToArray()) {
-     if (!Data.groups.Any(g => g.id == pair.Key)) {
-      if (Panel == pair.Value) { StopMotion(); DisposeMotion(); Panel = null; }
-      pair.Value.Dispose();
-      panels.Remove(pair.Key);
-     } else pair.Value.RefreshData();
+    if (Panel != null && Panel.Visible) {
+     if (Data.groups.Any(g => g.id == Panel.GroupId)) Panel.RefreshData();
+     else { Panel.Hide(); HideDim(); }
     }
    };
    if (Home.IsHandleCreated) Home.BeginInvoke(action); else action();
   }
 
-  // Build every folder's panel (window, icons, layout) once the desktop is idle, so the first
-  // open of any folder does not pay for window creation and icon extraction.
-  void WarmPanels() {
-   if (closing) return;
-   foreach (var g in Data.groups) {
-    PanelForm existing;
-    if (panels.TryGetValue(g.id, out existing) && !existing.IsDisposed) continue;
-    var p = new PanelForm(this, g.id);
-    IntPtr h = p.Handle;
-    p.WarmCaches(panels.Count == 0);
-    panels[g.id] = p;
-   }
-  }
-
-  // The morph window covers the whole path once (icon -> sheet, plus room for the spring's
-  // overshoot) so it never has to be moved or resized while animating.
-  static Rectangle MotionCanvas(Rectangle a, Rectangle b) {
-   Rectangle u = Rectangle.Union(a, b);
-   int pad = Math.Max(24, (int)(Math.Max(b.Width, b.Height) * 0.05));
-   u.Inflate(pad, pad);
-   return u;
-  }
-
+  // Opens folder `id`: the folder layer grows it out of its own desktop icon (sourceCenter is
+  // only a fallback when the folder has no desktop tile).
   public void OpenGroup(string id, Point sourceCenter) {
-   long openStarted = Stopwatch.GetTimestamp();
    try {
     Group(id);
-    if (Panel != null && Panel.GroupId == id && (Panel.Visible || motion != null) && !closeMotion) { ClosePanel(); return; }
-    StopMotion();
-    DisposeMotion();
-    if (Panel != null) Panel.Hide();
-    if (!panels.ContainsKey(id) || panels[id].IsDisposed) panels[id] = new PanelForm(this, id);
-    Panel = panels[id];
-    Panel.Text = "MacDesk · " + Group(id).title;
-    Panel.ResetTransientState();
-    Panel.RefreshData();
-    Rectangle work = Screen.FromPoint(sourceCenter).WorkingArea;
-    Size size = Panel.GetExpandedSize(sourceCenter);
-    int icon = DesktopFolderForm.IconSize;
-    originBounds = new Rectangle(sourceCenter.X - icon / 2, sourceCenter.Y - icon / 2, icon, icon);
-    int centerX = work.Left + (work.Width - size.Width) / 2, centerY = work.Top + (work.Height - size.Height) / 2 - 18;
-    expandedBounds = new Rectangle(Math.Max(work.Left + 12, Math.Min(work.Right - size.Width - 12, centerX)), Math.Max(work.Top + 12, Math.Min(work.Bottom - size.Height - 12, centerY)), size.Width, size.Height);
-    Panel.WindowState = FormWindowState.Normal;
-    Panel.Bounds = expandedBounds;
-    if (Panel.Handle == IntPtr.Zero) throw new InvalidOperationException("无法准备文件夹窗口。");
-    // Capture the blurred screen before any overlay of ours is on it.
-    ShowDim(work, 0.0);
-    Bitmap originBmp = DesktopFolders != null ? DesktopFolders.RenderTilePreview(id) : null;
-    toBounds = PanelForm.SheetBounds(expandedBounds);
-    motion = new GlassMotion(Panel.MotionSnapshot(), originBmp, backdrop, MotionCanvas(originBounds, toBounds), DesktopFolderForm.IconRadius, PanelForm.SheetRadius, OwnDialogWindow(), false);
-    fromBounds = originBounds;
-    motionBounds = fromBounds;
-    progressFrom = motionProgress = 0.0;
-    progressTo = 1.0;
-    closeMotion = false;
-    PrepareMotion();
-    motion.Present(fromBounds, 0.0, 1.0);
-    motion.Show();
+    if (Panel != null && Panel.GroupId == id && Panel.Visible && !Panel.IsClosing) { ClosePanel(); return; }
+    if (Panel != null && !Panel.IsDisposed && Panel.Visible) Panel.Hide(); // switching folders
+    if (Panel == null || Panel.IsDisposed) Panel = new FolderLayer(this, id);
+    Rectangle tile = Rectangle.Empty;
+    if (DesktopFolders != null && !DesktopFolders.IsDisposed) {
+     Rectangle? own = DesktopFolders.IconRectOnScreen(id);
+     if (own.HasValue) tile = own.Value;
+    }
+    if (tile.IsEmpty) tile = new Rectangle(sourceCenter.X - Metrics.DesktopIcon / 2, sourceCenter.Y - Metrics.DesktopIcon / 2, Metrics.DesktopIcon, Metrics.DesktopIcon);
+    Rectangle work = Screen.FromPoint(new Point(tile.X + tile.Width / 2, tile.Y + tile.Height / 2)).WorkingArea;
+    ShowDim(work); // captures the desktop before showing the folder
+    var layer = Panel;
+    layer.BackdropAlpha = a => { if (dim != null && !dim.IsDisposed) dim.SetAlpha(a); };
+    layer.Collapsed = delegate { if (Panel == layer) HideDim(); };
+    layer.Landing = delegate { if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.SetOpenFolder(null); };
+    Bitmap body = DesktopFolders != null ? DesktopFolders.RenderTileBody(id) : null;
+    layer.Open(id, work, tile, backdrop, body);
+    if (!layer.Visible) layer.Show(OwnDialogWindow());
     BringToTop(dim);
-    BringToTop(motion);
+    BringToTop(layer);
+    if (DesktopFolders != null) DesktopFolders.SetOpenFolder(id); // the layer now covers it
     if (DesktopFolders != null) DesktopFolders.TakeKeyboardFocus();
-    motionMouse = (GetAsyncKeyState(1) & 0x8000) != 0 || (GetAsyncKeyState(2) & 0x8000) != 0;
-    setupMs = (Stopwatch.GetTimestamp() - openStarted) * 1000.0 / Stopwatch.Frequency;
-    StartMotion();
-   } catch (Exception ex) { StopMotion(); DisposeMotion(); HideDim(); Fail(ex); }
+   } catch (Exception ex) { DiscardPrefetch(); if (Panel != null && !Panel.IsDisposed) Panel.Hide(); HideDim(); Fail(ex); }
   }
 
   public void ClosePanel() {
-   if (Panel == null || Panel.IsDisposed || closeMotion || (!Panel.Visible && motion == null)) return;
-   try {
-    if (motion != null) { reverseRequested = true; return; }
-    StopMotion();
-    if (dim == null || dim.IsDisposed) ShowDim(Screen.FromControl(Panel).WorkingArea, DimAlpha);
-    Bitmap originBmp = DesktopFolders != null ? DesktopFolders.RenderTilePreview(Panel.GroupId) : null;
-    motionBounds = PanelForm.SheetBounds(Panel.Bounds);
-    motion = new GlassMotion(Panel.MotionSnapshot(), originBmp, backdrop, MotionCanvas(originBounds, motionBounds), DesktopFolderForm.IconRadius, PanelForm.SheetRadius, OwnDialogWindow(), false);
-    motionProgress = 1.0;
-    PrepareMotion();
-    motion.Present(motionBounds, 1.0, 1.0);
-    motion.Show();
-    BringToTop(motion);
-    Panel.Hide();
-    fromBounds = motionBounds;
-    toBounds = originBounds;
-    progressFrom = 1.0;
-    progressTo = 0.0;
-    closeMotion = true;
-    setupMs = 0;
-    StartMotion();
-   } catch (Exception ex) { DisposeMotion(); HideDim(); Panel.Hide(); Fail(ex); }
-  }
-
-  [System.Runtime.InteropServices.DllImport("dwmapi.dll")] static extern int DwmFlush();
-
-  // Runs on its own thread: one UpdateLayeredWindow per display refresh, no message-loop jitter.
-  void RenderLoop(int generation) {
-   bool completed = false;
-   try {
-    while (motionRunning && !closing) {
-     if (Panel == null || Panel.IsDisposed || motion == null) return;
-     bool down = (GetAsyncKeyState(1) & 0x8000) != 0 || (GetAsyncKeyState(2) & 0x8000) != 0;
-     if (!closeMotion && (reverseRequested || (down && !motionMouse && !expandedBounds.Contains(Cursor.Position) && !SourceContains(Cursor.Position)))) {
-      // Interrupted while opening: fold back from wherever the sheet is right now.
-      reverseRequested = false;
-      fromBounds = motionBounds;
-      toBounds = originBounds;
-      progressFrom = motionProgress;
-      progressTo = 0.0;
-      closeMotion = true;
-      clock.Restart();
-      motionMouse = down;
-      continue;
-     }
-     motionMouse = down;
-     double t = Math.Min(1.0, clock.Elapsed.TotalMilliseconds / (closeMotion ? CloseMs : OpenMs));
-     double e = EvaluateSpring(t, closeMotion);
-     Rectangle b = new Rectangle(
-      (int)Math.Round(fromBounds.X + (toBounds.X - fromBounds.X) * e),
-      (int)Math.Round(fromBounds.Y + (toBounds.Y - fromBounds.Y) * e),
-      Math.Max(2, (int)Math.Round(fromBounds.Width + (toBounds.Width - fromBounds.Width) * e)),
-      Math.Max(2, (int)Math.Round(fromBounds.Height + (toBounds.Height - fromBounds.Height) * e)));
-     double prog = Math.Max(0.0, Math.Min(1.0, progressFrom + (progressTo - progressFrom) * e));
-     motionBounds = b;
-     motionProgress = prog;
-     long t0 = Stopwatch.GetTimestamp();
-     motion.Present(b, prog, 1.0);
-     BackdropOverlay d = dim;
-     if (d != null && !d.IsDisposed) d.SetAlphaThreadSafe(DimAlpha * Math.Min(1.0, prog * 1.25));
-     MotionLogFrame((Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency);
-     if (t >= 1.0) { completed = true; break; }
-     bool paced = false;
-     try { paced = DwmFlush() == 0; } catch { }
-     if (!paced) Thread.Sleep(4);
-    }
-   } catch (Exception ex) {
-    // Never leave a frozen motion layer on screen: tear it down, then report.
-    try {
-     Home.BeginInvoke((Action)delegate {
-      if (generation != motionGeneration) return;
-      StopMotion();
-      DisposeMotion();
-      HideDim();
-      if (Panel != null && !Panel.IsDisposed) Panel.Hide();
-      closeMotion = true;
-      Fail(ex);
-     });
-    } catch { }
-    return;
-   }
-   if (completed) {
-    try { Home.BeginInvoke((Action)delegate { if (generation == motionGeneration) FinishMotion(); }); } catch { }
-   }
+   if (Panel == null || Panel.IsDisposed || !Panel.Visible || Panel.IsClosing) return;
+   Rectangle? tile = DesktopFolders != null && !DesktopFolders.IsDisposed ? DesktopFolders.IconRectOnScreen(Panel.GroupId) : null;
+   Panel.CloseFolder(tile);
   }
 
   // ---- Data actions: thin UI wrappers over the backend (DeskService) ------------------------
@@ -536,15 +295,9 @@ namespace MacDeskNative {
    int clampedY = Math.Max(0, Math.Min(Math.Max(0, work.Height - Home.Height), y));
    // Keep the live card where it is saved, so it can't be stranded off-screen.
    if (Home.Location != new Point(clampedX, clampedY)) Home.Location = new Point(clampedX, clampedY);
-   Try(delegate { Service.SetHomePosition(clampedX, clampedY); });
+   if (Data.homeX != clampedX || Data.homeY != clampedY) Try(delegate { Service.SetHomePosition(clampedX, clampedY); });
   }
 
-  public void SetFolderPosition(string id, int x, int y) {
-   var positions = DesktopFolders == null ? null : DesktopFolders.SnapshotPositions();
-   var area = DesktopFolders == null ? new Size(Screen.PrimaryScreen.Bounds.Width, Screen.PrimaryScreen.WorkingArea.Height) : DesktopFolders.ClientSize;
-   Try(delegate { Service.SetGroupPosition(id, x, y, positions, area); });
-  }
-  public void ResetFolderPositions() { Try(delegate { Service.ResetGroupPositions(); }); }
 
   public void AddGroup() { var g = Modal(owner => EditDialogs.Group(owner, null)); if (g != null) Try(delegate { Service.AddGroup(g); }); }
   public void CreateAndOpenNewGroup(Point sourceCenter) {
@@ -615,11 +368,6 @@ namespace MacDeskNative {
    } catch (Exception ex) { Fail(ex); }
   }
   public void ToggleShowLabels() { Try(delegate { Service.ToggleShowLabels(); }); }
-  public void NotifyFocusCompleted() {
-   try {
-    if (tray != null) tray.ShowBalloonTip(4000, "MacDesk · 专注完成", "25 分钟番茄专注已结束，起来活动一下吧！", ToolTipIcon.Info);
-   } catch { }
-  }
   public void DeleteItem(string groupId, string itemId) {
    if (Modal(owner => MessageBox.Show(owner, "只删除此入口，不会删除原文件。", "移除入口", MessageBoxButtons.OKCancel, MessageBoxIcon.Question)) == DialogResult.OK)
     Try(delegate { Service.DeleteItem(groupId, itemId); });
@@ -668,12 +416,9 @@ namespace MacDeskNative {
   public void Quit() {
    if (closing) return;
    closing = true;
-   StopMotion();
-   DisposeMotion();
    HideDim();
    DiscardPrefetch();
-   foreach (var p in panels.Values) p.Dispose();
-   panels.Clear();
+   if (Panel != null) Panel.Dispose();
    if (tray != null) { tray.Visible = false; tray.Dispose(); }
    if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.Dispose();
    if (Home != null && !Home.IsDisposed) Home.Dispose();

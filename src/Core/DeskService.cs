@@ -148,6 +148,48 @@ namespace MacDesk.Core {
    });
   }
 
+  /// Pins several folders at once (e.g. the dragged folder plus the ones that made room for
+  /// it), as one atomic save. Same clamping and auto-placed pinning as SetGroupPosition.
+  public void SetGroupPositions(IDictionary<string, Point> positions, IDictionary<string, Point> currentLayout, Size area) {
+   if (positions == null) throw new ArgumentNullException("positions");
+   Edit(d => {
+    if (currentLayout != null)
+     foreach (var group in d.groups) { Point p; if (group.desktopX < 0 && currentLayout.TryGetValue(group.id, out p)) { group.desktopX = p.X; group.desktopY = p.Y; } }
+    foreach (var pair in positions) {
+     var g = FindGroup(d, pair.Key);
+     g.desktopX = Math.Max(24, Math.Min(Math.Max(24, area.Width - 112), pair.Value.X));
+     g.desktopY = Math.Max(24, Math.Min(Math.Max(24, area.Height - 154), pair.Value.Y));
+    }
+   });
+  }
+
+  /// One-time migration to order-only layout: folders that were pinned at desktop positions
+  /// are re-ordered in reading order (top-to-bottom, then left-to-right) ahead of unpinned
+  /// ones (which keep their relative order), and all pins are cleared. Returns true if it
+  /// changed anything. The desktop UI lays folders out purely by list order.
+  public bool MigratePinnedPositionsToOrder() {
+   if (!Data.groups.Exists(g => g.desktopX >= 0)) return false;
+   Edit(d => {
+    var indexed = new List<KeyValuePair<int, DeskGroup>>();
+    for (int i = 0; i < d.groups.Count; i++) indexed.Add(new KeyValuePair<int, DeskGroup>(i, d.groups[i]));
+    indexed.Sort((a, b) => {
+     bool pa = a.Value.desktopX >= 0, pb = b.Value.desktopX >= 0;
+     if (pa != pb) return pa ? -1 : 1;
+     if (pa) {
+      // Same row if the tops are within half a tile; then left to right.
+      int dy = a.Value.desktopY - b.Value.desktopY;
+      if (Math.Abs(dy) > 70) return dy;
+      int dx = a.Value.desktopX - b.Value.desktopX;
+      if (dx != 0) return dx;
+     }
+     return a.Key - b.Key;
+    });
+    d.groups.Clear();
+    foreach (var pair in indexed) { pair.Value.desktopX = -1; pair.Value.desktopY = -1; d.groups.Add(pair.Value); }
+   });
+   return true;
+  }
+
   /// Returns every folder to automatic grid placement.
   public void ResetGroupPositions() { Edit(d => { foreach (var g in d.groups) { g.desktopX = -1; g.desktopY = -1; } }); }
 

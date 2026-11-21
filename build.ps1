@@ -1,4 +1,4 @@
-﻿param([string]$OutputDirectory = (Join-Path $PSScriptRoot 'build'), [switch]$NoDeploy)
+param([string]$OutputDirectory = (Join-Path $PSScriptRoot 'build'), [switch]$NoDeploy)
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 # Layout: src\Core = backend (no UI), src\UI = frontend, src\Host = entry point + desktop hosting.
 $ErrorActionPreference = 'Stop'
@@ -7,7 +7,7 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 if (-not (Test-Path $csc)) { throw 'csc.exe not found; install .NET Framework 4.x' }
 $src = Join-Path $PSScriptRoot 'src'
 $core = @(Get-ChildItem (Join-Path $src 'Core') -Filter *.cs | Sort-Object Name | ForEach-Object FullName)
-$ui = @(Get-ChildItem (Join-Path $src 'UI'), (Join-Path $src 'Host') -Filter *.cs | Sort-Object Name | ForEach-Object FullName)
+$ui = @(Get-ChildItem (Join-Path $src 'UI'), (Join-Path $src 'Host') -Filter *.cs -Recurse | Sort-Object FullName | ForEach-Object FullName)
 $common = @('/nologo', '/langversion:4', '/codepage:65001', '/optimize+', '/warnaserror+')
 
 # 1) Backend boundary check: Core must compile on its own, WITHOUT System.Windows.Forms.

@@ -78,7 +78,7 @@ namespace MacDesk.Core {
    lock (gate) {
     using (var writeLock = AcquireWriteLock()) {
      var s = Serializer();
-     var next = s.Deserialize<DesktopData>(s.Serialize(Data));
+     var next = Data.CopyForEdit();
      mutation(next);
      Validate(next);
      byte[] bytes = new UTF8Encoding(false).GetBytes(s.Serialize(next));

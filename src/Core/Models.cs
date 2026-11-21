@@ -27,6 +27,13 @@ namespace MacDesk.Core {
    homeX = -1;
    homeY = -1;
   }
+
+  internal DesktopData CopyForEdit() {
+   var copy = (DesktopData)MemberwiseClone();
+   copy.notes = new Dictionary<string, string>(notes, notes.Comparer);
+   copy.groups = groups.ConvertAll(group => group.CopyForEdit());
+   return copy;
+  }
  }
  public class DeskGroup {
   public string id { get; set; }
@@ -40,6 +47,12 @@ namespace MacDesk.Core {
    desktopX = -1;
    desktopY = -1;
   }
+
+  internal DeskGroup CopyForEdit() {
+   var copy = (DeskGroup)MemberwiseClone();
+   copy.items = items.ConvertAll(item => item.CopyForEdit());
+   return copy;
+  }
  }
  public class DeskItem {
   public string id { get; set; }
@@ -49,5 +62,7 @@ namespace MacDesk.Core {
   public string target { get; set; }
   public string icon { get; set; }
   public string arguments { get; set; }
+
+  internal DeskItem CopyForEdit() { return (DeskItem)MemberwiseClone(); }
  }
 }

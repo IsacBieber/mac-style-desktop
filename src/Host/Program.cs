@@ -153,13 +153,9 @@ namespace MacDeskNative {
    foreach(var bad in new[]{new[]{"--root"},new[]{"--root","--diagnostics"},new[]{"--rooot",root},new[]{"--root",root,"--root",root},new[]{"--self-test","--launch"}}){bool rejected=false;try{ParseArguments(bad,out launch,out diagnostics,out selfTest);}catch(ArgumentException){rejected=true;}Check(rejected,"invalid startup arguments fail closed");}
    // Backend.
    CoreTests.Run(Path.Combine(root,"core"));
-   // Frontend: motion curves, springs, grid snapping, controller wiring.
-   Check(AppController.EvaluateSpring(0.0,false)==0.0&&AppController.EvaluateSpring(1.0,false)==1.0&&AppController.EvaluateSpring(1.0,true)==1.0,"spring boundaries");
-   double peak=0;for(int i=1;i<100;i++)peak=Math.Max(peak,AppController.EvaluateSpring(i/100.0,false));
-   Check(peak>1.0&&peak<1.05,"open spring has a subtle overshoot");
-   Check(AppController.EvaluateSpring(0.25,false)>0.5,"open spring responds quickly");
-   double prev=0;bool monotone=true;for(int i=1;i<=100;i++){double v=AppController.EvaluateSpring(i/100.0,true);if(v<prev-1e-9)monotone=false;prev=v;}
-   Check(monotone&&prev==1.0,"closing spring is critically damped");
+   CheckBackdropSampling();
+   CheckCompactCalendar();
+   // Frontend: springs, grid snapping, controller wiring, folder transition.
    var spring=new Spring(0,0.3,0.8);spring.Target=1;for(int i=0;i<240;i++)spring.Step(1/240.0);var spring60=new Spring(0,0.3,0.8);spring60.Target=1;for(int i=0;i<60;i++)spring60.Step(1/60.0);
    Check(spring.Settled&&spring60.Settled&&Math.Abs(spring.Value-1)<0.001,"interactive springs settle the same at 60 and 240 Hz");
    Point snapped=DesktopFolderForm.SnapPointToGrid(455,31,440,1920,1080);
@@ -172,9 +168,62 @@ namespace MacDeskNative {
     string g=app.Data.groups[0].id;
     Check(app.RenameGroupInline(g,"重命名")&&app.Data.groups[0].title=="重命名","controller forwards to the backend");
     Check(!app.RenameGroupInline(g,"  "),"controller ignores empty inline rename");
+    // Folder morph must not shake: once the contents are full size they may not move again.
+    // Folder open/close: icons stay inside the glass, move monotonically, land exactly where the
+    // open panel draws them, and reversing half-way is continuous.
+    using(var layer=new FolderLayer(app,app.Data.groups[0].id)){var wa=Screen.PrimaryScreen.WorkingArea;layer.PrepareTransitionForTest(wa,new Rectangle(wa.Left+676,wa.Top+30,Metrics.DesktopIcon,Metrics.DesktopIcon));string problem=layer.CheckTransitionInvariants();Check(problem==null,"folder transition: "+problem);}
+    var gridFixture = new DeskGroup { id = "folder-handoff-test", title = "Folder handoff" };
+    for (int i = 0; i < 21; i++) gridFixture.items.Add(EntryServices.FromUrl("https://example.test/" + i));
+    app.Service.AddGroup(gridFixture);
+    using (var layer = new FolderLayer(app, gridFixture.id)) {
+     layer.PrepareTransitionForTest(new Rectangle(0, 0, 960, 480), new Rectangle(32, 30, Metrics.DesktopIcon, Metrics.DesktopIcon));
+     string problem = layer.CheckTransitionHandoffs();
+     Check(problem == null, "folder grid handoff: " + problem);
+    }
     app.Quit();
    }
    File.WriteAllText(Path.Combine(root,"PASS.txt"),"Backend (CoreTests) and frontend self-tests passed.");
+  }
+  static void CheckCompactCalendar() {
+   var months = new[] { new DateTime(2026, 2, 1), new DateTime(2026, 11, 1), new DateTime(2026, 5, 1) };
+   int previousBottom = 0;
+   foreach (DateTime month in months) {
+    Rectangle card = HomeForm.CalendarCardBounds(month, false);
+    int days = DateTime.DaysInMonth(month.Year, month.Month);
+    if (previousBottom != 0) Check(card.Bottom - previousBottom == 34, "calendar grows by one row");
+    previousBottom = card.Bottom;
+    Check(HomeForm.CalendarCardBounds(month, true).Bottom - card.Bottom == 24, "calendar reserves one note line");
+    Check(card.Bottom - HomeForm.DayCircle(month, days).Bottom == 14, "compact padding below the last row");
+    for (int day = 1; day <= days; day++) {
+     RectangleF cell = HomeForm.DayCircle(month, day);
+     Check(HomeForm.HitCalendarDay(Point.Round(new PointF(cell.X + cell.Width / 2, cell.Y + cell.Height / 2)), month) == day, "calendar day hit matches drawing");
+    }
+    if (month.DayOfWeek != DayOfWeek.Sunday) {
+     RectangleF first = HomeForm.DayCircle(month, 1);
+     Check(HomeForm.HitCalendarDay(new Point((int)first.X - 20, (int)first.Y + 15), month) == -1, "leading calendar cell is empty");
+    }
+    RectangleF last = HomeForm.DayCircle(month, days);
+    Check(HomeForm.HitCalendarDay(new Point((int)last.X + 15, (int)last.Y + 45), month) == -1, "under the calendar rows is empty");
+   }
+  }
+  static void CheckBackdropSampling() {
+   var area = new Rectangle(-53, 17, 83, 59);
+   using (var source = new Bitmap(area.Width, area.Height)) {
+    using (var g = Graphics.FromImage(source))
+    using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(new Rectangle(Point.Empty, area.Size), Color.Navy, Color.Orange, 25f))
+     g.FillRectangle(brush, new Rectangle(Point.Empty, area.Size));
+    using (var backdrop = Backdrop.FromCapture(source, area))
+    using (var whole = backdrop.CopyRegion(area))
+    using (var crop = backdrop.CopyRegion(new Rectangle(area.X + 17, area.Y + 11, 31, 23)))
+    using (var dimmed = backdrop.TakeDimmed()) {
+     Check(dimmed.Size == area.Size && dimmed.GetPixel(40, 26).A == 255, "opaque dimmed backdrop");
+     Check(dimmed.GetPixel(40, 26).GetBrightness() < whole.GetPixel(40, 26).GetBrightness(), "backdrop dimming");
+     Check(whole.GetPixel(0, 0) != whole.GetPixel(area.Width - 1, area.Height - 1), "backdrop preserves the gradient");
+     for (int y = 0; y < crop.Height; y++)
+      for (int x = 0; x < crop.Width; x++)
+       Check(crop.GetPixel(x, y) == whole.GetPixel(x + 17, y + 11), "cropped backdrop matches whole-screen sampling");
+    }
+   }
   }
  }
 }

@@ -26,7 +26,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -NoDeploy  # 只
 
 ```text
 DesktopData { version: 1, groups: DeskGroup[], notes: {"yyyy-MM-dd": string}, showLabels, homeX, homeY }
-DeskGroup   { id, title, subtitle, items: DeskItem[], desktopX, desktopY }   // desktopX/Y = -1 表示自动排布
+DeskGroup   { id, title, subtitle, items: DeskItem[], desktopX, desktopY }   // 桌面按 groups 的顺序排在固定网格里；desktopX/Y 仅为兼容旧数据保留，界面不再使用（启动时 MigratePinnedPositionsToOrder 会把旧坐标换算成顺序并清为 -1）
 DeskItem    { id, title, description, type: "app"|"file"|"folder"|"url", target, icon, arguments }
 ```
 
@@ -52,7 +52,8 @@ DeskItem    { id, title, description, type: "app"|"file"|"folder"|"url", target,
 | `AddGroup(group)` / `CreateGroupWithUniqueTitle(baseTitle)` | 新建文件夹 |
 | `RenameGroup(id, title)` / `UpdateGroup(id, 旧标题, 旧副标题, 新标题, 新副标题)` | 改名；后者是乐观并发（中途被改过就拒绝） |
 | `DeleteGroup(id)` / `MoveGroup(id, insertIndex)` | 删除（不碰原文件）/ 排序 |
-| `SetGroupPosition(id, x, y, 当前布局, 区域)` / `ResetGroupPositions()` | 桌面位置 / 回到自动网格 |
+| `MigratePinnedPositionsToOrder()` | 旧版的自由坐标 → 按阅读顺序重排并清除坐标（启动时调用一次） |
+| `SetGroupPosition` / `SetGroupPositions` / `ResetGroupPositions` | 旧的坐标接口，当前界面不再使用，仅为兼容保留 |
 | `AddPaths(groupId, paths, index)` / `AddUrl(groupId, url, index)` / `AddItem(groupId, item)` | 添加入口（只记录路径，绝不移动或复制文件） |
 | `UpdateItem(groupId, itemId, 编辑前, 编辑后)` / `RenameItem(...)` / `DeleteItem(...)` | 修改、重命名、删除入口 |
 | `MoveItem(源分类, itemId, 目标分类, insertIndex)` | 排序或跨文件夹移动；insertIndex 是移动**前**目标列表中的插入位置，-1 = 末尾 |

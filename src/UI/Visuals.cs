@@ -136,6 +136,15 @@ namespace MacDeskNative {
    g.DrawImage(image, new Rectangle(x, y, image.Width, image.Height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, scratch);
    g.InterpolationMode = im;
   }
+
+  // Folder icons use the same pixel-aligned bitmap draw from preview size through panel size.
+  internal static void DrawIcon(Graphics g, Image image, Rectangle dest, float alpha, System.Drawing.Imaging.ImageAttributes scratch, System.Drawing.Imaging.ColorMatrix matrix) {
+   if (image == null || alpha <= 0.005f) return;
+   if (dest.Size == image.Size) { Blit(g, image, dest.X, dest.Y, alpha, scratch, matrix); return; }
+   matrix.Matrix33 = alpha;
+   scratch.SetColorMatrix(matrix);
+   g.DrawImage(image, dest, 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, scratch);
+  }
  }
 
  // Damped harmonic spring, parameterised like SwiftUI (response seconds, damping fraction).
@@ -174,64 +183,6 @@ namespace MacDeskNative {
   }
  }
 
- // Vsync-paced frame callbacks on the UI thread. DwmFlush returns once per composition,
- // so frames follow the real refresh rate (240 Hz here) instead of the ~15.6 ms timer grid.
- internal sealed class FramePump : IDisposable {
-  [DllImport("dwmapi.dll")] static extern int DwmFlush();
-  readonly Control owner;
-  readonly Func<double, bool> tick;
-  readonly Stopwatch clock = Stopwatch.StartNew();
-  readonly MethodInvoker frame;
-  int generation, pending;
-  bool running;
-  double last;
-
-  public FramePump(Control owner, Func<double, bool> tick) {
-   this.owner = owner;
-   this.tick = tick;
-   frame = OnFrame;
-  }
-  public bool Running { get { return running; } }
-
-  public void Start() {
-   if (running) return;
-   if (owner.IsDisposed || !owner.IsHandleCreated) return;
-   running = true;
-   last = clock.Elapsed.TotalSeconds;
-   int gen = ++generation;
-   var t = new Thread(() => Loop(gen)) { IsBackground = true, Priority = ThreadPriority.AboveNormal, Name = "MacDesk frame pump" };
-   t.Start();
-  }
-  public void Stop() { running = false; generation++; }
-
-  void Loop(int gen) {
-   try {
-    while (gen == generation) {
-     bool waited = false;
-     try { waited = DwmFlush() == 0; } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
-     if (!waited) Thread.Sleep(4);
-     if (gen != generation) return;
-     if (Interlocked.CompareExchange(ref pending, 1, 0) == 0) {
-      try { owner.BeginInvoke(frame); } catch { pending = 0; return; }
-     }
-    }
-   } catch { }
-  }
-
-  void OnFrame() {
-   pending = 0;
-   if (!running || owner.IsDisposed) return;
-   double now = clock.Elapsed.TotalSeconds;
-   double dt = Math.Max(0.0, Math.Min(0.05, now - last));
-   last = now;
-   bool more;
-   try { more = tick(dt); } catch { Stop(); throw; }
-   if (!more) Stop();
-  }
-
-  public void Dispose() { Stop(); }
- }
-
  // Persistent 32bpp premultiplied DIB for UpdateLayeredWindow: no per-frame allocation and
  // optional dirty-rect presentation (only the changed pixels are sent to DWM).
  internal sealed class LayeredSurface : IDisposable {
@@ -241,6 +192,25 @@ namespace MacDeskNative {
   Size size, capacity;
 
   public Size Size { get { return size; } }
+
+  // Diagnostics: save what is currently presented (premultiplied) as a PNG.
+  public void SaveSnapshot(string path) {
+   if (bitmap == null) return;
+   graphics.Flush(FlushIntention.Sync);
+   using (var copy = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppArgb))
+   using (var g = Graphics.FromImage(copy)) {
+    g.Clear(Color.FromArgb(255, 40, 44, 52)); // neutral backdrop so translucency is visible
+    g.DrawImage(bitmap, new Rectangle(0, 0, size.Width, size.Height), new Rectangle(0, 0, size.Width, size.Height), GraphicsUnit.Pixel);
+    copy.Save(path, ImageFormat.Png);
+   }
+  }
+
+  // Alpha of a presented pixel (diagnostics: the OS hit-tests layered windows by alpha).
+  public int AlphaAt(int x, int y) {
+   if (bitmap == null || x < 0 || y < 0 || x >= size.Width || y >= size.Height) return 0;
+   graphics.Flush(FlushIntention.Sync);
+   return (Marshal.ReadInt32(bits, (y * capacity.Width + x) * 4) >> 24) & 255;
+  }
 
   // Keeps a DIB at least this large, so a window that grows every frame (the folder morph)
   // never reallocates mid-animation.
@@ -367,29 +337,42 @@ namespace MacDeskNative {
 
   public const int BackdropDim = 112;
 
-  // Safe on any thread: pure GDI/GDI+ on objects owned by this call.
-  public static Backdrop FromScreen(Rectangle area) {
-   using (var shot = new Bitmap(Math.Max(1, area.Width), Math.Max(1, area.Height), PixelFormat.Format32bppRgb)) {
+  // Capture before the folder window appears, then process these pixels on a worker.
+  public static Bitmap CaptureScreen(Rectangle area) {
+   var shot = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+   try {
     using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(area.Location, Point.Empty, area.Size, CopyPixelOperation.SourceCopy);
-    var result = new Backdrop(Blur(shot, area.Size, 6, 1.35f), area);
-    var dimmed = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppPArgb);
-    using (var g = Graphics.FromImage(dimmed)) {
-     g.CompositingMode = CompositingMode.SourceCopy;
-     g.DrawImageUnscaled(result.Image, 0, 0);
-     g.CompositingMode = CompositingMode.SourceOver;
-     using (var b = new SolidBrush(Color.FromArgb(BackdropDim, 0, 0, 0))) g.FillRectangle(b, 0, 0, area.Width, area.Height);
-    }
-    result.Dimmed = dimmed;
-    return result;
-   }
+    return shot;
+   } catch { shot.Dispose(); throw; }
   }
 
-  public static Backdrop FromImage(Image source, Rectangle area) { return new Backdrop(Blur(source, area.Size, 8, 1.25f), area); }
+  public static Backdrop FromCapture(Image source, Rectangle area) {
+   Bitmap small = BlurSmall(source, area.Size, 6, 1.35f);
+   try {
+    using (var dark = small.Clone(new Rectangle(Point.Empty, small.Size), PixelFormat.Format32bppPArgb)) {
+     using (var g = Graphics.FromImage(dark))
+     using (var b = new SolidBrush(Color.FromArgb(BackdropDim, 0, 0, 0))) g.FillRectangle(b, 0, 0, dark.Width, dark.Height);
+     return new Backdrop(small, area) { Dimmed = ExpandBlur(dark, area.Size, new Rectangle(Point.Empty, area.Size)) };
+    }
+   } catch { small.Dispose(); throw; }
+  }
 
-  // Downscale -> 3-pass box blur -> saturate -> upscale. ~20 ms for a 1080p screen.
-  static Bitmap Blur(Image source, Size full, int factor, float saturation) {
+  public static Backdrop FromImage(Image source, Rectangle area) {
+   return new Backdrop(BlurSmall(source, area.Size, 8, 1.25f), area);
+  }
+
+  public Bitmap TakeDimmed() { Bitmap image = Dimmed; Dimmed = null; return image; }
+
+  public Bitmap CopyRegion(Rectangle region) {
+   region.Offset(-Area.X, -Area.Y);
+   return ExpandBlur(Image, Area.Size, region);
+  }
+
+  // Downscale -> three separable box passes -> saturate. Only the pixels needed for display are expanded.
+  static Bitmap BlurSmall(Image source, Size full, int factor, float saturation) {
    int sw = Math.Max(4, full.Width / factor), sh = Math.Max(4, full.Height / factor);
-   using (var small = new Bitmap(sw, sh, PixelFormat.Format32bppArgb)) {
+   var small = new Bitmap(sw, sh, PixelFormat.Format32bppArgb);
+   try {
     using (var g = Graphics.FromImage(small)) {
      // Plain bilinear is ~5x cheaper than the high-quality prefilter; the heavy blur that
      // follows hides any aliasing from the decimation.
@@ -399,24 +382,82 @@ namespace MacDeskNative {
      g.DrawImage(source, new Rectangle(0, 0, sw, sh));
     }
     var data = small.LockBits(new Rectangle(0, 0, sw, sh), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
-    int[] px = new int[sw * sh];
-    Marshal.Copy(data.Scan0, px, 0, px.Length);
-    int radius = Math.Max(2, 26 / factor + 2);
-    for (int pass = 0; pass < 3; pass++) { BoxH(px, sw, sh, radius); BoxV(px, sw, sh, radius); }
-    Saturate(px, saturation);
-    Marshal.Copy(px, 0, data.Scan0, px.Length);
-    small.UnlockBits(data);
-    var result = new Bitmap(full.Width, full.Height, PixelFormat.Format32bppPArgb);
-    using (var g = Graphics.FromImage(result))
-    using (var attributes = new ImageAttributes()) {
-     attributes.SetWrapMode(WrapMode.TileFlipXY);
-     g.InterpolationMode = InterpolationMode.Bilinear;
-     g.PixelOffsetMode = PixelOffsetMode.Half;
-     g.CompositingMode = CompositingMode.SourceCopy;
-     g.DrawImage(small, new Rectangle(0, 0, full.Width, full.Height), 0, 0, sw, sh, GraphicsUnit.Pixel, attributes);
-    }
+    try {
+     int[] px = new int[sw * sh];
+     Marshal.Copy(data.Scan0, px, 0, px.Length);
+     int radius = Math.Max(2, 26 / factor + 2);
+     for (int pass = 0; pass < 3; pass++) { BoxH(px, sw, sh, radius); BoxV(px, sw, sh, radius); }
+     Saturate(px, saturation);
+     Marshal.Copy(px, 0, data.Scan0, px.Length);
+    } finally { small.UnlockBits(data); }
+    return small;
+   } catch { small.Dispose(); throw; }
+  }
+
+  // Bilinear sampling of opaque blurred pixels. Each source row is expanded at most once,
+  // then reused for every output row that interpolates between that pair.
+  static Bitmap ExpandBlur(Bitmap small, Size full, Rectangle region) {
+   var pixels = new int[small.Width * small.Height];
+   var source = small.LockBits(new Rectangle(Point.Empty, small.Size), ImageLockMode.ReadOnly, small.PixelFormat);
+   try {
+    for (int y = 0; y < small.Height; y++)
+     Marshal.Copy(IntPtr.Add(source.Scan0, y * source.Stride), pixels, y * small.Width, small.Width);
+   } finally { small.UnlockBits(source); }
+
+   int[] columns = new int[region.Width];
+   for (int x = 0; x < columns.Length; x++) columns[x] = SamplePosition(region.X + x, small.Width, full.Width);
+   int[] upper = new int[region.Width], lower = new int[region.Width], row = new int[region.Width];
+   int upperIndex = -1, lowerIndex = -1;
+   var result = new Bitmap(region.Width, region.Height, PixelFormat.Format32bppPArgb);
+   try {
+    var output = result.LockBits(new Rectangle(Point.Empty, result.Size), ImageLockMode.WriteOnly, result.PixelFormat);
+    try {
+     for (int y = 0; y < region.Height; y++) {
+      int sample = SamplePosition(region.Y + y, small.Height, full.Height);
+      int y0 = sample >> 8, y1 = Math.Min(small.Height - 1, y0 + 1);
+      if (upperIndex != y0) {
+       if (lowerIndex == y0) {
+        int[] previousUpper = upper; upper = lower; lower = previousUpper;
+        lowerIndex = upperIndex;
+       } else ExpandRow(pixels, small.Width, y0, columns, upper);
+       upperIndex = y0;
+      }
+      if ((sample & 255) == 0) {
+       Marshal.Copy(upper, 0, IntPtr.Add(output.Scan0, y * output.Stride), region.Width);
+       continue;
+      }
+      if (lowerIndex != y1) {
+       ExpandRow(pixels, small.Width, y1, columns, lower);
+       lowerIndex = y1;
+      }
+      uint fraction = (uint)(sample & 255);
+      for (int x = 0; x < row.Length; x++) row[x] = MixOpaque(upper[x], lower[x], fraction);
+      Marshal.Copy(row, 0, IntPtr.Add(output.Scan0, y * output.Stride), region.Width);
+     }
+    } finally { result.UnlockBits(output); }
     return result;
+   } catch { result.Dispose(); throw; }
+  }
+
+  static int SamplePosition(int pixel, int sourceLength, int destinationLength) {
+   int sample = (int)(((2L * pixel + 1) * sourceLength * 128) / destinationLength) - 128;
+   return Math.Max(0, Math.Min((sourceLength - 1) * 256, sample));
+  }
+
+  static void ExpandRow(int[] source, int width, int y, int[] columns, int[] destination) {
+   int offset = y * width;
+   for (int x = 0; x < columns.Length; x++) {
+    int column = columns[x], x0 = column >> 8;
+    destination[x] = MixOpaque(source[offset + x0], source[offset + Math.Min(width - 1, x0 + 1)], (uint)(column & 255));
    }
+  }
+
+  static int MixOpaque(int a, int b, uint fraction) {
+   const uint rb = 0x00ff00ff, green = 0x0000ff00;
+   uint left = unchecked((uint)a), right = unchecked((uint)b), inverse = 256 - fraction;
+   uint redBlue = (((left & rb) * inverse + (right & rb) * fraction + 0x00800080u) >> 8) & rb;
+   uint g = (((left & green) * inverse + (right & green) * fraction + 0x00008000u) >> 8) & green;
+   return unchecked((int)(0xff000000u | redBlue | g));
   }
 
   static void BoxH(int[] px, int w, int h, int r) {
@@ -457,11 +498,15 @@ namespace MacDeskNative {
   }
   static int Clamp(float v) { return v < 0 ? 0 : v > 255 ? 255 : (int)v; }
 
-  // Brush that paints this backdrop aligned to the screen, for a surface whose top-left is at surfaceOrigin (screen coords).
-  public TextureBrush CreateBrush(Point surfaceOrigin) {
-   var brush = new TextureBrush(Image, WrapMode.Clamp);
-   brush.TranslateTransform(Area.X - surfaceOrigin.X, Area.Y - surfaceOrigin.Y);
-   return brush;
+  // Expand just the requested rectangle while preserving its alignment to the full image.
+  public TextureBrush CreateBrush(Rectangle region, Point surfaceOrigin) {
+   region.Intersect(Area);
+   if (region.Width <= 0 || region.Height <= 0) return null;
+   using (var pixels = CopyRegion(region)) {
+    var brush = new TextureBrush(pixels, WrapMode.Clamp);
+    brush.TranslateTransform(region.X - surfaceOrigin.X, region.Y - surfaceOrigin.Y);
+    return brush;
+   }
   }
 
   public void Dispose() {
@@ -481,9 +526,13 @@ namespace MacDeskNative {
 
   public static Backdrop Current {
    get {
-    if (current == null || (DateTime.UtcNow - lastCheck).TotalSeconds > 3) Refresh(false);
+    RefreshIfNeeded();
     return current;
    }
+  }
+
+  public static void RefreshIfNeeded() {
+   if (current == null || (DateTime.UtcNow - lastCheck).TotalSeconds > 3) Refresh(false);
   }
 
   public static void Refresh(bool force) {
@@ -585,6 +634,109 @@ namespace MacDeskNative {
    using (var brush = new LinearGradientBrush(new RectangleF(r.X, r.Y - 1, r.Width, r.Height + 2), Color.FromArgb((int)(120 * strength), 255, 255, 255), Color.FromArgb((int)(28 * strength), 255, 255, 255), LinearGradientMode.Vertical))
    using (var pen = new Pen(brush, 1f))
     g.DrawPath(pen, path);
+  }
+ }
+}
+
+namespace MacDeskNative {
+ // Per-frame timing on the real desktop, enabled by MACDESK_FRAME_LOG=<file>.
+ // Columns: ms since start, surface, dt between frames (ms), render+present work (ms), detail.
+ internal static class FrameLog {
+  static readonly string path = Environment.GetEnvironmentVariable("MACDESK_FRAME_LOG");
+  static readonly System.Text.StringBuilder buffer = new System.Text.StringBuilder();
+  static readonly Stopwatch clock = Stopwatch.StartNew();
+  static double lastFlush;
+  public static bool On { get { return !String.IsNullOrEmpty(path); } }
+  public static double Now { get { return clock.Elapsed.TotalMilliseconds; } }
+  public static void Add(string surface, double dtMs, double workMs, string detail) {
+   if (!On) return;
+   buffer.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "{0:0.0}\t{1}\t{2:0.00}\t{3:0.00}\t{4}\r\n", Now, surface, dtMs, workMs, detail);
+   if (Now - lastFlush > 1000) Flush();
+  }
+  public static void Flush() {
+   if (!On || buffer.Length == 0) return;
+   try { File.AppendAllText(path, buffer.ToString()); } catch { }
+   buffer.Length = 0;
+   lastFlush = Now;
+  }
+ }
+}
+
+namespace MacDeskNative {
+ // Text drawn as filled glyph outlines. GDI+ DrawString on a transparent layered surface renders
+ // thin and soft; outlines are crisp and let us add a little weight (a hairline stroke around
+ // the glyphs), which is how the labels get a "medium" weight Windows' CJK fonts don't ship.
+ internal static class TextStyle {
+  static readonly System.Collections.Generic.Dictionary<string, FontFamily> families = new System.Collections.Generic.Dictionary<string, FontFamily>();
+  internal static FontFamily Family(string name) {
+   FontFamily f;
+   if (families.TryGetValue(name, out f)) return f;
+   try { f = new FontFamily(name); } catch (ArgumentException) { f = new FontFamily("Microsoft YaHei UI"); }
+   families[name] = f;
+   return f;
+  }
+
+  internal static float Width(string text, string family, FontStyle style, float px) {
+   if (String.IsNullOrEmpty(text)) return 0;
+   using (var path = new GraphicsPath()) {
+    path.AddString(text, Family(family), (int)style, px, PointF.Empty, StringFormat.GenericTypographic);
+    return path.GetBounds().Width;
+   }
+  }
+
+  static GraphicsPath Build(string text, string family, FontStyle style, float px, RectangleF rect, StringFormat format) {
+   var path = new GraphicsPath();
+   path.AddString(text, Family(family), (int)style, px, rect, format);
+   return path;
+  }
+
+  // weight: extra stroke width in px (0 = the font's own weight).
+  internal static void Draw(Graphics g, string text, string family, FontStyle style, float px, Color color, RectangleF rect, StringFormat format, float weight) {
+   DrawShadowed(g, text, family, style, px, color, rect, format, weight, 0f);
+  }
+
+  // shadow: 0..1 strength of a soft dark halo + 1 px drop (for text over wallpaper / glass).
+  internal static void DrawShadowed(Graphics g, string text, string family, FontStyle style, float px, Color color, RectangleF rect, StringFormat format, float weight, float shadow) {
+   if (String.IsNullOrEmpty(text) || color.A == 0) return;
+   using (var path = Build(text, family, style, px, rect, format)) {
+    if (color.A == 255) { Paint(g, path, color, weight, shadow); return; }
+    // Translucent ink: render opaque into a layer, then composite once with the alpha, so the
+    // weight stroke and the fill do not double up into darker seams.
+    RectangleF b = path.GetBounds();
+    b.Inflate(weight + 4, weight + 4);
+    if (b.Width < 1 || b.Height < 1) return;
+    using (var layer = new Bitmap((int)Math.Ceiling(b.Width), (int)Math.Ceiling(b.Height), PixelFormat.Format32bppPArgb)) {
+     using (var lg = Graphics.FromImage(layer)) {
+      lg.Clear(Color.Transparent);
+      lg.SmoothingMode = SmoothingMode.AntiAlias;
+      lg.PixelOffsetMode = PixelOffsetMode.Half;
+      lg.TranslateTransform(-b.X, -b.Y);
+      Paint(lg, path, Color.FromArgb(255, color), weight, shadow);
+     }
+     using (var ia = new ImageAttributes()) {
+      ia.SetColorMatrix(new ColorMatrix { Matrix33 = color.A / 255f });
+      g.DrawImage(layer, new Rectangle((int)Math.Round(b.X), (int)Math.Round(b.Y), layer.Width, layer.Height), 0, 0, layer.Width, layer.Height, GraphicsUnit.Pixel, ia);
+     }
+    }
+   }
+  }
+
+  static void Paint(Graphics g, GraphicsPath path, Color color, float weight, float shadow) {
+   var smoothing = g.SmoothingMode;
+   g.SmoothingMode = SmoothingMode.AntiAlias;
+   if (shadow > 0.01f) {
+    using (var halo = new Pen(Color.FromArgb((int)(60 * shadow), 0, 0, 0), 3.4f + weight) { LineJoin = LineJoin.Round })
+     g.DrawPath(halo, path);
+    using (var drop = (GraphicsPath)path.Clone())
+    using (var m = new System.Drawing.Drawing2D.Matrix()) {
+     m.Translate(0, 1.1f);
+     drop.Transform(m);
+     using (var b = new SolidBrush(Color.FromArgb((int)(110 * shadow), 0, 0, 0))) g.FillPath(b, drop);
+    }
+   }
+   using (var ink = new SolidBrush(color)) g.FillPath(ink, path);
+   if (weight > 0.01f) using (var pen = new Pen(color, weight) { LineJoin = LineJoin.Round }) g.DrawPath(pen, path);
+   g.SmoothingMode = smoothing;
   }
  }
 }

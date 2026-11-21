@@ -9,24 +9,25 @@ using System.Windows.Forms;
 using MacDesk.Core;
 
 namespace MacDeskNative {
- // An open folder, iOS style: big title above a frosted sheet, icons with labels underneath.
- // Per-pixel-alpha layered window rendered by us at display refresh rate (springs for hover,
- // press, reflow, scroll and reveal). Same material + same snapshot as GlassMotion, so the
- // hand-off from the morph to the live panel is invisible.
- public class PanelForm : Form {
+ // The open folder, iOS style, and the ONLY thing that draws it - from the first frame of the
+ // open transition to the last frame of the close. One layered, non-activating window covering
+ // the path of the animation; one progress spring p (0 = the desktop folder icon, 1 = the open panel);
+ // one geometry (FolderLayout / Geometry(p)). There is no separate morph window and no hand-off,
+ // so the frame, icons, labels and title cannot get out of step.
+ public class FolderLayer : Form {
   private const string ItemFormat = "MacDeskNative.Item";
-  // Geometry (pixels).
-  public const int TitleBand = 60;
-  public const float SheetRadius = 34f;
-  private const int PadX = 26, PadTop = 26, PadBottom = 22, CellW = 106, CellH = 112, GapX = 8, GapY = 10, IconPx = 64;
-  private const int SearchH = 36, SearchGap = 14, PickerHeaderH = 34;
+  // Geometry comes from Metrics (one source for every folder size).
+  public const int TitleBand = Metrics.TitleBand;
+  public const float SheetRadius = Metrics.SheetRadius;
+  private const int PadX = Metrics.PadX, PadTop = Metrics.PadTop, PadBottom = Metrics.PadBottom, CellW = Metrics.CellW, CellH = Metrics.CellH, GapX = Metrics.GapX, GapY = Metrics.GapY, IconPx = Metrics.IconPx;
+  private const int SearchH = Metrics.SearchH, SearchGap = Metrics.SearchGap, PickerHeaderH = Metrics.PickerHeaderH;
 
   private readonly AppController app;
-  private readonly string groupId;
+  private string groupId;
   private readonly List<PanelEntry> filtered = new List<PanelEntry>();
   private readonly List<TileView> tiles = new List<TileView>();
   private readonly HashSet<ContextMenuStrip> activeMenus = new HashSet<ContextMenuStrip>();
-  private readonly Font titleFont = Ui.MakeFont(Ui.Cjk, 23f, FontStyle.Bold);
+  private readonly Font titleFont = Ui.MakeFont(Ui.Cjk, 24f, FontStyle.Bold);
   private readonly Font labelFont = Ui.MakeFont(Ui.Cjk, 12.5f, FontStyle.Regular);
   private readonly Font subLabelFont = Ui.MakeFont(Ui.Cjk, 11f, FontStyle.Regular);
   private readonly Font searchFont = Ui.MakeFont(Ui.Cjk, 14.5f, FontStyle.Regular);
@@ -86,24 +87,23 @@ namespace MacDeskNative {
    public int SlotIndex;
    public RectangleF Target;
    public bool Initialized;
-   public readonly Spring X = new Spring(0, 0.38, 0.86);
-   public readonly Spring Y = new Spring(0, 0.38, 0.86);
+   public readonly Spring X = new Spring(0, 0.28, 0.9);
+   public readonly Spring Y = new Spring(0, 0.28, 0.9);
    public readonly Spring Scale = new Spring(1, 0.22, 0.86);
    public readonly Spring Select = new Spring(0, 0.18, 1.0);
+   public readonly Spring Hover = new Spring(0, 0.16, 1.0);
    public readonly Spring Fade = new Spring(1, 0.2, 1.0);
-   public IEnumerable<Spring> Springs { get { yield return X; yield return Y; yield return Scale; yield return Select; yield return Fade; } }
+   public bool Step(double dt) { return X.Step(dt) | Y.Step(dt) | Scale.Step(dt) | Select.Step(dt) | Hover.Step(dt) | Fade.Step(dt); }
   }
 
-  public static Rectangle SheetBounds(Rectangle window) { return new Rectangle(window.X, window.Y + TitleBand, window.Width, Math.Max(1, window.Height - TitleBand)); }
-
-  public PanelForm(AppController app, string groupId) {
+  public FolderLayer(AppController app, string groupId) {
    this.app = app;
    this.groupId = groupId;
+   blitAttributes.SetWrapMode(WrapMode.TileFlipXY);
    AutoScaleMode = AutoScaleMode.None;
    FormBorderStyle = FormBorderStyle.None;
    ShowInTaskbar = false;
    StartPosition = FormStartPosition.Manual;
-   ClientSize = new Size(560, 380);
    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint, true);
    KeyPreview = true;
    AllowDrop = true;
@@ -113,8 +113,10 @@ namespace MacDeskNative {
    AttachDrop(this);
    pump = new FramePump(this, Tick);
 
+   work = Screen.PrimaryScreen.WorkingArea;
    RefreshData();
-   ClientSize = GetExpandedSize(new Point(Left + Width / 2, Top + Height / 2));
+   panelSize = ComputePanelSize();
+   origin = FolderLayout.PanelOrigin(work.Size, panelSize);
    LayoutContent(true);
 
    outsideClickTimer = new Timer();
@@ -145,24 +147,451 @@ namespace MacDeskNative {
    searchReveal.Snap(0);
    hoveredTile = null;
    pressedTile = null;
+   mouseClient = new Point(-999, -999);
+   mouseArmed = false;
+   selectedId = null;
+   backgroundDrop = false;
+   dropGlow.Snap(0);
    dragSourceTileIndex = -1;
    dragHoverInsertIndex = -1;
    scroll.Snap(0);
    scrollbar.Snap(0);
-   titleReveal.Snap(1);
-   foreach (var t in tiles) { t.Scale.Snap(1); t.Fade.Snap(1); }
+   scrollbarHold = 0;
+   titleReveal.Snap(0);
+   titleHover.Snap(0);
+   keyboardSelection = false;
+   foreach (var t in tiles) { t.Scale.Snap(1); t.Fade.Snap(1); t.Hover.Snap(0); t.Select.Snap(0); }
   }
 
+  // The blurred screen behind the folder. Only the part under this window is copied (a full
+  // screen copy is ~8 MB and used to stall the frame where the morph hands over to the panel).
+  private Backdrop backdropSource;
+  private Rectangle materialArea;
   internal void SetBackdrop(Backdrop backdrop) {
+   if (backdrop == backdropSource && (backdrop == null || material != null)) return;
+   backdropSource = backdrop;
    if (material != null) { material.Dispose(); material = null; }
-   if (backdrop != null && backdrop.Image != null) {
-    material = new TextureBrush(backdrop.Image, WrapMode.Clamp);
-    materialOrigin = backdrop.Area.Location;
+   EnsureMaterial();
+  }
+  private void EnsureMaterial() {
+   Backdrop bd = backdropSource;
+   if (bd == null || bd.Image == null) { if (material != null) { material.Dispose(); material = null; } return; }
+   Rectangle window = PanelScreenRect();
+   if (!tileRect.IsEmpty) window = Rectangle.Union(window, new Rectangle(tileRect.X + work.X, tileRect.Y + work.Y, tileRect.Width, tileRect.Height));
+   if (material != null && materialArea.Contains(window)) return;
+   Rectangle crop = Rectangle.Intersect(Rectangle.Inflate(window, 48, 48), bd.Area);
+   if (crop.Width < 1 || crop.Height < 1) return;
+   if (material != null) material.Dispose();
+   using (var part = bd.CopyRegion(crop))
+    material = new TextureBrush(part, WrapMode.Clamp);
+   materialOrigin = crop.Location;
+   materialArea = crop;
+  }
+
+
+  // === Open / close (the whole transition lives here) =====================================
+
+  private Rectangle work;                 // screen work area
+  private Rectangle canvas;               // window bounds in work-area coordinates
+  private Point origin;                   // panel top-left in work-area coordinates
+  private Size panelSize;                 // title band + sheet
+  private Size PanelSize { get { return panelSize; } }
+  private readonly Spring progress = new Spring(1, 0.27, 1.0); // critically damped: never overshoots
+  private Rectangle tileRect = Rectangle.Empty; // desktop folder icon, work-area coordinates
+  private Bitmap tileBody;                // that icon's frosted body (no mini icons), for the first frames
+  private bool collapsedNow, justOpened;
+  internal Action<double> BackdropAlpha;  // backdrop dim follows p in the same frame
+  internal Action Collapsed;
+  internal Action Landing;
+
+  internal bool IsOpening { get { return Visible && progress.Target >= 1 && progress.Value < 1; } }
+  internal bool IsClosing { get { return progress.Target <= 0; } }
+  internal bool CanSetOpeningBackdrop { get { return IsOpening && progress.Value < 0.25; } }
+
+  private Rectangle PanelScreenRect() { return new Rectangle(work.X + origin.X, work.Y + origin.Y, panelSize.Width, panelSize.Height); }
+  private Point ToWindow(Point panelPoint) { return new Point(panelPoint.X + origin.X - canvas.X, panelPoint.Y + origin.Y - canvas.Y); }
+  private Point ToPanel(Point windowPoint) { return new Point(windowPoint.X + canvas.X - origin.X, windowPoint.Y + canvas.Y - origin.Y); }
+  private MouseEventArgs ToPanel(MouseEventArgs e) {
+   Point point = ToPanel(e.Location);
+   return new MouseEventArgs(e.Button, e.Clicks, point.X, point.Y, e.Delta);
+  }
+
+  // Lays the folder out for `workArea` without showing anything (also used offscreen by tests).
+  internal void Prepare(Rectangle workArea) {
+   work = workArea;
+   RefreshData();
+   panelSize = ComputePanelSize();
+   origin = FolderLayout.PanelOrigin(work.Size, panelSize);
+   LayoutContent(true);
+   IntPtr h = Handle;
+  }
+
+  // Starts the open transition from the desktop folder icon at `tileScreen`.
+  internal void Open(string id, Rectangle workArea, Rectangle tileScreen, Backdrop backdrop, Bitmap body) {
+   ResetTransientState();
+   groupId = id;
+   Prepare(workArea);
+   tileRect = new Rectangle(tileScreen.X - work.X, tileScreen.Y - work.Y, tileScreen.Width, tileScreen.Height);
+   if (tileBody != null) tileBody.Dispose();
+   tileBody = body;
+   backdropSource = backdrop;
+   if (material != null) { material.Dispose(); material = null; }
+   EnsureSheetCache();
+   CaptureTransitionGrid();
+   progress.Snap(0);
+   progress.Target = 1;
+   justOpened = true;
+   Render(); // the first frame is ready before the window becomes visible
+  }
+
+  internal void CloseFolder(Rectangle? desktopTile) {
+   if (!Visible || IsClosing) return;
+   if (editing) CommitInlineRename(true);
+   if (liveDrag != null) EndLiveDrag(null);
+   // A reversal keeps its existing path. A new close starts from the frame the user saw.
+   if (progress.Value >= 1) {
+    if (desktopTile.HasValue) {
+     tileRect = desktopTile.Value;
+     tileRect.Offset(-work.X, -work.Y);
+    }
+    CaptureTransitionGrid();
+   }
+   hoveredTile = null; pressedTile = null;
+   progress.Target = 0;
+   WakeAnimation();
+  }
+
+  // Click or key during the opening: land the panel immediately.
+  internal void CompleteOpening() {
+   if (!IsOpening) return;
+   progress.Snap(1);
+   titleReveal.Snap(1);
+   WakeAnimation();
+  }
+
+  // Advances p; returns true while the transition is moving.
+  private bool StepTransition(double dt) {
+   if (progress.Settled && progress.Value >= 1) return false;
+   // The first frame of an open costs several ms (full clear + present). Don't let that
+   // setup time count as motion, or frame two jumps ahead.
+   if (justOpened) { justOpened = false; dt = Math.Min(dt, AnimationClock.FramePeriod); }
+   bool moving = progress.Step(dt);
+   // A spring creeps toward its end for a long time. Once nothing on screen is more than half
+   // a pixel from where it ends, land now: otherwise icons crawl by sub-pixel amounts (soft,
+   // edges shimmering) and then snap crisp - which reads as a small shake after opening.
+   if (progress.Target >= 1 && (!moving || (1 - progress.Value) * TransitionSpan() < 0.5)) { progress.Snap(1); titleReveal.Snap(1); moving = false; }
+   if (BackdropAlpha != null) BackdropAlpha(Math.Max(0.0, Math.Min(1.0, progress.Value * 1.25)));
+   if (progress.Target <= 0 && (!moving || progress.Value * TransitionSpan() < 0.5)) {
+    progress.Snap(0);
+    collapsedNow = true;
+    if (Landing != null) Landing(); // the desktop shows its folder icon again first...
+    Hide();                          // ...then this layer goes: no blank frame between them
+    if (Collapsed != null) Collapsed();
+    return false;
+   }
+   return moving;
+  }
+
+  // ---- Geometry of the transition: everything is a function of p ------------------------
+
+  internal struct TransitionItem {
+   public bool Plus;
+   public int PreviewSlot; // -1 for panel-only items
+   public DeskItem Item;
+   public string Label, SubLabel;
+   public float PanelAlpha;
+   public RectangleF Icon, LabelRect;
+   public Rectangle FinalIcon;
+   public float IconAlpha, LabelAlpha;
+  }
+  internal sealed class TransitionFrame {
+   public RectangleF Frame, GridClip;
+   public float Radius, FaceAlpha, TitleAlpha, Rim;
+   public PointF TitleShift; // the title rides on the frame's top edge
+   public readonly List<TransitionItem> Items = new List<TransitionItem>();
+  }
+
+  private readonly List<TransitionItem> transitionGrid = new List<TransitionItem>();
+  private Rectangle transitionGridClip;
+
+  private void CaptureTransitionGrid() {
+   transitionGrid.Clear();
+   transitionGridClip = GridClip();
+   transitionGridClip.Offset(origin);
+   int previewCount = group != null && !tileRect.IsEmpty ? Math.Min(9, group.items.Count) : 0;
+   var shared = new bool[previewCount];
+   foreach (var tile in tiles) {
+    float x = tile.X.F, y = tile.Y.F - scroll.F;
+    Rectangle icon = FolderLayout.IconInCell(x, y, tile.Scale.F);
+    icon.Offset(origin);
+    var label = new Rectangle(origin.X + (int)Math.Round(x - 6), origin.Y + (int)Math.Round(y + Metrics.IconTop + IconPx + Metrics.LabelGap), CellW + 12, 36);
+    if (!transitionGridClip.IntersectsWith(icon) && !transitionGridClip.IntersectsWith(label)) continue;
+    PanelEntry entry = tile.Entry;
+    int slot = !pickerMode && entry != null && !entry.IsCrossGroup && entry.Index < previewCount ? entry.Index : -1;
+    if (slot >= 0) shared[slot] = true;
+    transitionGrid.Add(new TransitionItem {
+     Plus = tile.IsPlus, Item = entry == null ? null : entry.Item, PreviewSlot = slot,
+     Label = tile.IsPlus ? "添加" : entry.Item.title, SubLabel = entry != null && entry.IsCrossGroup ? entry.GroupTitle : null,
+     LabelRect = label, FinalIcon = icon, PanelAlpha = Math.Max(0f, Math.Min(1f, tile.Fade.F))
+    });
+   }
+   // A filtered or scrolled panel may not show every item in the desktop preview.
+   for (int i = 0; i < previewCount; i++)
+    if (!shared[i]) transitionGrid.Add(new TransitionItem { Item = group.items[i], PreviewSlot = i });
+   span = -1;
+  }
+
+  private Rectangle SheetInWindow() { return new Rectangle(origin.X, origin.Y + TitleBand, panelSize.Width, Math.Max(1, panelSize.Height - TitleBand)); }
+
+  private static float Smooth(double x) { x = Math.Max(0, Math.Min(1, x)); return (float)(x * x * (3 - 2 * x)); }
+  private static RectangleF Lerp(RectangleF a, RectangleF b, float t) {
+   return new RectangleF(a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t, a.Width + (b.Width - a.Width) * t, a.Height + (b.Height - a.Height) * t);
+  }
+  // The same rectangle, carried proportionally from sheet S into the small frame T.
+  private static RectangleF MapInto(RectangleF r, RectangleF S, RectangleF T) {
+   float rx = T.Width / S.Width, ry = T.Height / S.Height, k = Math.Min(rx, ry);
+   return new RectangleF(T.X + (r.X - S.X) * rx, T.Y + (r.Y - S.Y) * ry, r.Width * k, r.Height * k);
+  }
+
+  // Frame, icons, labels and title at progress p (window coordinates). Linear interpolation of
+  // rectangles that start inside the folder icon and end inside the sheet stays inside the
+  // interpolated frame, so icons can never run ahead of the glass.
+  internal TransitionFrame Geometry(double p) {
+   float t = (float)Math.Max(0, Math.Min(1, p));
+   var f = new TransitionFrame();
+   RectangleF S = SheetInWindow();
+   int side = Metrics.DesktopIcon;
+   RectangleF T = tileRect.IsEmpty ? new RectangleF(S.X + (S.Width - side) / 2, S.Y + (S.Height - side) / 2, side, side) : (RectangleF)tileRect;
+   f.Frame = Lerp(T, S, t);
+   f.GridClip = Lerp(T, transitionGridClip, t);
+   f.Radius = Math.Min(Metrics.DesktopIconRadius + (SheetRadius - Metrics.DesktopIconRadius) * t, Math.Min(f.Frame.Width, f.Frame.Height) / 2f);
+   f.FaceAlpha = 1f - Smooth(t / 0.35);
+   // The title sits on the glass's top edge and moves with it, fading in over most of the
+   // motion, so text and glass arrive together.
+   f.TitleAlpha = Smooth((t - 0.2) / 0.7);
+   f.TitleShift = new PointF(f.Frame.X + f.Frame.Width / 2f - (S.X + S.Width / 2f), f.Frame.Y - S.Y);
+   f.Rim = 0.55f + 0.45f * t;
+   foreach (var anchor in transitionGrid) {
+    TransitionItem item = anchor;
+    bool shared = item.PreviewSlot >= 0;
+    RectangleF start = shared ? Metrics.IconPixels(Metrics.MiniSlot(item.PreviewSlot, T)) : MapInto(item.FinalIcon, S, T);
+    if (item.FinalIcon.IsEmpty) {
+     item.Icon = MapInto(start, T, f.Frame);
+     item.IconAlpha = 1f - Smooth(t / 0.35);
+    } else {
+     item.Icon = Lerp(start, item.FinalIcon, t);
+     item.IconAlpha = shared ? 1f + (item.PanelAlpha - 1f) * t : item.PanelAlpha * Smooth((t - 0.45) / 0.45);
+     item.LabelRect.Offset(item.Icon.X + item.Icon.Width / 2f - (item.FinalIcon.X + item.FinalIcon.Width / 2f), item.Icon.Bottom - item.FinalIcon.Bottom);
+     item.LabelAlpha = item.PanelAlpha * Smooth((t - 0.45) / 0.5);
+    }
+    f.Items.Add(item);
+   }
+   return f;
+  }
+
+  // Longest distance (px) anything travels between p = 0 and p = 1; fixed for one open.
+  private float span = -1;
+  private float TransitionSpan() {
+   if (span >= 0) return span;
+   TransitionFrame a = Geometry(0), b = Geometry(1);
+   float m = MaxDelta(a.Frame, b.Frame);
+   for (int i = 0; i < a.Items.Count && i < b.Items.Count; i++) m = Math.Max(m, MaxDelta(a.Items[i].Icon, b.Items[i].Icon));
+   span = Math.Max(1f, m);
+   return span;
+  }
+  private static float MaxDelta(RectangleF a, RectangleF b) {
+   return Math.Max(Math.Max(Math.Abs(a.Left - b.Left), Math.Abs(a.Right - b.Right)), Math.Max(Math.Abs(a.Top - b.Top), Math.Abs(a.Bottom - b.Bottom)));
+  }
+
+  private Rectangle TransitionArea(TransitionFrame f) {
+   Rectangle frame = Rectangle.FromLTRB((int)Math.Floor(f.Frame.Left), (int)Math.Floor(f.Frame.Top), (int)Math.Ceiling(f.Frame.Right), (int)Math.Ceiling(f.Frame.Bottom));
+   Rectangle title = TitleRect();
+   title.Offset(origin.X + (int)Math.Floor(f.TitleShift.X), origin.Y + (int)Math.Floor(f.TitleShift.Y));
+   title.Inflate(10, 10);
+   Rectangle area = Rectangle.Inflate(frame, 6, 6);
+   foreach (var it in f.Items) if (it.LabelAlpha > 0.01f) area = Rectangle.Union(area, Rectangle.Inflate(Rectangle.Round(it.LabelRect), 2, 2));
+   return f.TitleAlpha > 0.01f ? Rectangle.Union(area, title) : area;
+  }
+
+  private readonly System.Drawing.Imaging.ImageAttributes transitionAttributes = new System.Drawing.Imaging.ImageAttributes();
+  private readonly System.Drawing.Imaging.ColorMatrix transitionMatrix = new System.Drawing.Imaging.ColorMatrix();
+  private bool transitionWrapSet;
+  private void DrawScaled(Graphics g, Image image, RectangleF dest, float alpha) {
+   if (!transitionWrapSet) { transitionAttributes.SetWrapMode(WrapMode.TileFlipXY); transitionWrapSet = true; }
+   if (image == null || alpha <= 0.01f || dest.Width < 0.5f || dest.Height < 0.5f) return;
+   // Same path for every alpha: TileFlipXY stops the edge pixels from blending with
+   // "outside the image", which otherwise makes edges flicker as the sub-pixel phase changes.
+   transitionMatrix.Matrix33 = Math.Min(1f, alpha);
+   transitionAttributes.SetColorMatrix(transitionMatrix);
+   g.DrawImage(image, new[] { new PointF(dest.Left, dest.Top), new PointF(dest.Right, dest.Top), new PointF(dest.Left, dest.Bottom) }, new RectangleF(0, 0, image.Width, image.Height), GraphicsUnit.Pixel, transitionAttributes);
+  }
+
+  private void DrawTransition(Graphics g, TransitionFrame f) {
+   using (var shape = Ui.Squircle(f.Frame, f.Radius)) {
+    if (material != null) {
+     material.ResetTransform();
+     material.TranslateTransform(materialOrigin.X - work.X, materialOrigin.Y - work.Y);
+    }
+    Material.Fill(g, shape, material, Material.SheetTint, Material.SheetFallback);
+    // First frames: the glass still looks exactly like the desktop folder icon.
+    if (tileBody != null && f.FaceAlpha > 0.01f) DrawScaled(g, tileBody, f.Frame, f.FaceAlpha);
+   }
+   Material.Rim(g, f.Frame, f.Radius, f.Rim);
+   DrawTransitionItems(g, f);
+   if (f.TitleAlpha > 0.01f) {
+    Rectangle r = TitleRect();
+    Bitmap title = EnsureTitleCache(r);
+    var at = new RectangleF(origin.X + r.X - 4 + f.TitleShift.X, origin.Y + r.Y - 2 + f.TitleShift.Y, title.Width, title.Height);
+    DrawScaled(g, title, at, f.TitleAlpha);
    }
   }
 
-  internal void PresentNow() { Render(); }
-  internal void BeginReveal() { titleReveal.Snap(0); titleReveal.Target = 1; WakeAnimation(); }
+  private void DrawTransitionItems(Graphics g, TransitionFrame f) {
+   var state = g.Save();
+   g.IntersectClip(f.GridClip);
+   foreach (var it in f.Items) {
+    if (it.IconAlpha > 0.005f) {
+     Rectangle pixels = Metrics.IconPixels(it.Icon);
+     if (it.Plus) DrawPlusGlyph(g, pixels, it.IconAlpha);
+     else Ui.DrawIcon(g, CachedIcon(it.Item), pixels, it.IconAlpha, blitAttributes, blitMatrix);
+    }
+    if (it.LabelAlpha > 0.01f) {
+     Bitmap label = CachedLabel(it.Label, it.SubLabel, it.Plus ? 0.85f : 1f);
+     Blit(g, label, it.LabelRect.X, it.LabelRect.Y, it.LabelAlpha);
+    }
+   }
+   g.Restore(state);
+  }
+
+  private void DrawPlusGlyph(Graphics g, RectangleF icon, float alpha) {
+   if (alpha <= 0.01f) return;
+   float radius = icon.Width * 0.2237f;
+   using (var path = Ui.Squircle(icon, radius))
+   using (var b = new SolidBrush(Color.FromArgb((int)(36 * alpha), 255, 255, 255)))
+   using (var pen = new Pen(Color.FromArgb((int)(70 * alpha), 255, 255, 255), 1f)) { g.FillPath(b, path); g.DrawPath(pen, path); }
+   float arm = icon.Width * 0.2f, cx = icon.X + icon.Width / 2, cy = icon.Y + icon.Height / 2;
+   using (var pen = new Pen(Color.FromArgb((int)(235 * alpha), 255, 255, 255), 2.6f * icon.Width / IconPx)) {
+    pen.StartCap = pen.EndCap = LineCap.Round;
+    g.DrawLine(pen, cx - arm, cy, cx + arm, cy);
+    g.DrawLine(pen, cx, cy - arm, cx, cy + arm);
+   }
+  }
+
+  // ---- Self-test: the transition is structurally in step ---------------------------------
+  // Returns null when all invariants hold, otherwise a description of the first violation.
+  internal string CheckTransitionInvariants() {
+   // 1) icons never leave the glass; 2) everything moves monotonically with p.
+   TransitionFrame prev = null;
+   for (int k = 0; k <= 200; k++) {
+    TransitionFrame f = Geometry(k / 200.0);
+    foreach (var it in f.Items) {
+     RectangleF fr = RectangleF.Inflate(f.Frame, 0.51f, 0.51f);
+     RectangleF visible = RectangleF.Intersect(it.Icon, f.GridClip);
+     if (it.IconAlpha > 0.005f && visible.Width > 0 && visible.Height > 0 && !fr.Contains(visible)) return "visible icon outside the frame at p=" + (k / 200.0);
+    }
+    if (prev != null) {
+     for (int i = 0; i < f.Items.Count; i++) {
+      RectangleF a = prev.Items[i].Icon, b = f.Items[i].Icon, end = f.Items[i].FinalIcon;
+      if (f.Items[i].FinalIcon.IsEmpty) continue;
+      if (Math.Sign(Math.Round(b.X - a.X, 4)) * Math.Sign(Math.Round(end.X - a.X, 4)) < 0 || Math.Sign(Math.Round(b.Y - a.Y, 4)) * Math.Sign(Math.Round(end.Y - a.Y, 4)) < 0)
+       return "icon moved away from its target at p=" + (k / 200.0);
+     }
+    }
+    prev = f;
+   }
+   // 3) at p = 1 every icon is exactly where the open panel draws it (whole pixels).
+   TransitionFrame done = Geometry(1);
+   if (done.Frame != (RectangleF)SheetInWindow()) return "frame does not land on the sheet";
+   foreach (var it in done.Items) if (!it.FinalIcon.IsEmpty && it.Icon != (RectangleF)it.FinalIcon) return "icon does not land on its cell: " + it.Icon + " vs " + it.FinalIcon;
+   // 4) reversing half-way is continuous: the frame never jumps between frames at 240 Hz.
+   var spring = new Spring(0, 0.34, 1.0) { Target = 1 };
+   float maxStep = 0, lastX = Geometry(0).Frame.X;
+   for (int n = 0; n < 240; n++) {
+    if (n == 30) spring.Target = 0;
+    spring.Step(1 / 240.0);
+    float x = Geometry(spring.Value).Frame.X;
+    maxStep = Math.Max(maxStep, Math.Abs(x - lastX));
+    lastX = x;
+   }
+   float span = Math.Abs(SheetInWindow().X - (tileRect.IsEmpty ? SheetInWindow().X : tileRect.X));
+   if (maxStep > Math.Max(2f, span * 0.12f)) return "frame jumps " + maxStep + " px in one frame when reversed";
+   return null;
+  }
+
+  // Compare the last animated pixels to the real grid painters, including clipped rows.
+  internal string CheckTransitionHandoffs() {
+   string problem = CompareTransitionHandoffs();
+   if (problem != null) return problem;
+   int scrollLimit = Math.Max(0, (int)(contentHeight - GridViewport().Height));
+   if (scrollLimit == 0) return null;
+   scroll.Snap(scrollLimit - 0.5);
+   CaptureTransitionGrid();
+   problem = CompareTransitionHandoffs();
+   if (problem != null) return "after scrolling: " + problem;
+   searchQuery = group.items[2].target;
+   searchReveal.Snap(1);
+   scroll.Snap(0);
+   RefreshData();
+   LayoutContent(true);
+   CaptureTransitionGrid();
+   return CompareTransitionHandoffs();
+  }
+
+  private string CompareTransitionHandoffs() {
+   double nearEnd = 0.24 / TransitionSpan();
+   byte[] desktop = GridPixels(tileRect, g => DesktopFolderForm.DrawMiniGrid(g, group, tileRect, blitAttributes, blitMatrix));
+   if (!SamePixels(desktop, GridPixels(tileRect, g => DrawTransitionItems(g, Geometry(nearEnd))))) return "transition does not match the desktop preview";
+   byte[] panel = GridPixels(transitionGridClip, g => {
+    g.TranslateTransform(origin.X, origin.Y);
+    g.IntersectClip(GridClip());
+    DrawGrid(g, false);
+   });
+   if (!SamePixels(panel, GridPixels(transitionGridClip, g => DrawTransitionItems(g, Geometry(1 - nearEnd))))) return "transition does not match the panel grid";
+   return null;
+  }
+
+  private static byte[] GridPixels(Rectangle area, Action<Graphics> draw) {
+   var format = System.Drawing.Imaging.PixelFormat.Format32bppPArgb;
+   using (var bitmap = new Bitmap(area.Width, area.Height, format)) {
+    using (var g = Graphics.FromImage(bitmap)) {
+     Ui.PrepareQuality(g);
+     g.TranslateTransform(-area.X, -area.Y);
+     draw(g);
+    }
+    var data = bitmap.LockBits(new Rectangle(Point.Empty, area.Size), System.Drawing.Imaging.ImageLockMode.ReadOnly, format);
+    try {
+     var pixels = new byte[data.Stride * data.Height];
+     Marshal.Copy(data.Scan0, pixels, 0, pixels.Length);
+     return pixels;
+    } finally { bitmap.UnlockBits(data); }
+   }
+  }
+
+  private static bool SamePixels(byte[] a, byte[] b) {
+   for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+   return true;
+  }
+
+  // Offscreen: open as if from a desktop folder at `tileScreen` (tests / bench).
+  internal void PrepareTransitionForTest(Rectangle workArea, Rectangle tileScreen) {
+   ResetTransientState();
+   Prepare(workArea);
+   tileRect = new Rectangle(tileScreen.X - work.X, tileScreen.Y - work.Y, tileScreen.Width, tileScreen.Height);
+   EnsureSheetCache(); // as Open() does
+   CaptureTransitionGrid();
+   progress.Snap(0);
+   progress.Target = 1;
+  }
+  internal double TransitionFrameMs(double p) {
+   progress.Snap(p);
+   long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+   Render();
+   double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+   string dir = Environment.GetEnvironmentVariable("MACDESK_BENCH_FRAMES");
+   if (dir != null && Math.Abs(p * 120 - Math.Round(p * 120)) < 1e-6 && (int)Math.Round(p * 120) % 12 == 0 && !System.IO.File.Exists(System.IO.Path.Combine(dir, "open_" + ((int)Math.Round(p * 120)).ToString("000") + ".png")))
+    surface.SaveSnapshot(System.IO.Path.Combine(dir, "open_" + ((int)Math.Round(p * 120)).ToString("000") + ".png"));
+   return ms;
+  }
 
   // --- Geometry -------------------------------------------------------------------------
 
@@ -172,9 +601,9 @@ namespace MacDeskNative {
   }
   private Rectangle GridViewport() {
    int top = GridTop();
-   return new Rectangle(PadX, top, Math.Max(1, ClientSize.Width - PadX * 2), Math.Max(1, ClientSize.Height - top - PadBottom));
+   return new Rectangle(PadX, top, Math.Max(1, PanelSize.Width - PadX * 2), Math.Max(1, PanelSize.Height - top - PadBottom));
   }
-  private Rectangle SheetRect() { return new Rectangle(0, TitleBand, ClientSize.Width, Math.Max(1, ClientSize.Height - TitleBand)); }
+  private Rectangle SheetRect() { return new Rectangle(0, TitleBand, PanelSize.Width, Math.Max(1, PanelSize.Height - TitleBand)); }
   private string measuredTitle;
   private int measuredTitleWidth;
   private static readonly Bitmap measureBitmap = new Bitmap(1, 1);
@@ -184,31 +613,21 @@ namespace MacDeskNative {
     using (var g = Graphics.FromImage(measureBitmap)) measuredTitleWidth = (int)Math.Ceiling(g.MeasureString(t, titleFont).Width) + 28;
     measuredTitle = t;
    }
-   int w = Math.Min(ClientSize.Width - 40, Math.Max(120, measuredTitleWidth));
-   return new Rectangle((ClientSize.Width - w) / 2, 8, w, TitleBand - 18);
+   int w = Math.Min(PanelSize.Width - 40, Math.Max(120, measuredTitleWidth));
+   return new Rectangle((PanelSize.Width - w) / 2, 8, w, TitleBand - 18);
   }
   private Rectangle SearchRect() {
    int top = pickerMode ? TitleBand + PadTop + PickerHeaderH + 12 : TitleBand + PadTop - (int)Math.Round((1 - searchReveal.Value) * 10);
-   return new Rectangle(PadX + 4, top, ClientSize.Width - PadX * 2 - 8, SearchH);
+   return new Rectangle(PadX + 4, top, PanelSize.Width - PadX * 2 - 8, SearchH);
   }
   private Rectangle PickerDoneBounds() { return new Rectangle(PadX, TitleBand + PadTop - 4, 72, PickerHeaderH); }
-  private Rectangle PickerFolderBounds() { return new Rectangle(ClientSize.Width - PadX - 72, TitleBand + PadTop - 4, 72, PickerHeaderH); }
-  private Rectangle PickerFileBounds() { return new Rectangle(ClientSize.Width - PadX - 72 - 66, TitleBand + PadTop - 4, 64, PickerHeaderH); }
+  private Rectangle PickerFolderBounds() { return new Rectangle(PanelSize.Width - PadX - 72, TitleBand + PadTop - 4, 72, PickerHeaderH); }
+  private Rectangle PickerFileBounds() { return new Rectangle(PanelSize.Width - PadX - 72 - 66, TitleBand + PadTop - 4, 64, PickerHeaderH); }
 
   private string TitleText() { return pickerMode ? "添加到「" + (group != null ? group.title : "") + "」" : (group != null ? group.title ?? "文件夹" : "文件夹"); }
 
-  public Size GetExpandedSize(Point sourceCenter) {
-   Rectangle area = Screen.FromPoint(sourceCenter).WorkingArea;
-   int cells = pickerMode ? Math.Max(12, filtered.Count) : (group != null ? group.items.Count : filtered.Count) + 1;
-   int columns = pickerMode ? 6 : Math.Max(3, Math.Min(5, cells <= 4 ? Math.Max(3, cells) : (cells <= 9 ? 4 : 5)));
-   int rows = Math.Max(1, (cells + columns - 1) / columns);
-   int width = PadX * 2 + columns * CellW + (columns - 1) * GapX;
-   int top = pickerMode ? PadTop + PickerHeaderH + 12 + SearchH + SearchGap : PadTop;
-   int gridH = rows * CellH + (rows - 1) * GapY;
-   int maxSheet = (int)(area.Height * 0.80) - TitleBand;
-   int sheetH = Math.Min(top + gridH + PadBottom, maxSheet);
-   if (pickerMode) sheetH = Math.Max(sheetH, Math.Min(maxSheet, 520));
-   return new Size(Math.Min(width, area.Width - 48), TitleBand + Math.Max(PadTop + CellH + PadBottom, sheetH));
+  private Size ComputePanelSize() {
+   return FolderLayout.PanelSize(work.Size, pickerMode, group != null ? group.items.Count : filtered.Count, filtered.Count);
   }
 
   // --- Data -----------------------------------------------------------------------------
@@ -292,9 +711,8 @@ namespace MacDeskNative {
    layoutBusy = true;
    try {
     Rectangle view = GridViewport();
-    gridColumns = Math.Max(1, (view.Width + GapX) / (CellW + GapX));
-    int usedW = gridColumns * CellW + (gridColumns - 1) * GapX;
-    float left = view.X + (view.Width - usedW) * 0.5f;
+    gridColumns = FolderLayout.Columns(view.Width);
+    float left = FolderLayout.GridLeft(view, gridColumns);
     int movable = 0;
     foreach (var t in tiles) if (!t.IsPlus) movable++;
     for (int i = 0; i < tiles.Count; i++) {
@@ -325,20 +743,29 @@ namespace MacDeskNative {
 
   // --- Animation ------------------------------------------------------------------------
 
+  private bool renderRequested, hadMotion;
+
   private void WakeAnimation() {
    if (IsDisposed || Disposing || !IsHandleCreated) return;
    if (!Visible) return;
+   renderRequested = true;
    pump.Start();
   }
 
   private bool Tick(double dt) {
-   bool active = false;
+   bool requested = renderRequested;
+   renderRequested = false;
+   bool active = StepTransition(dt);
+   if (collapsedNow) { collapsedNow = false; hadMotion = false; return false; }
+   if (progress.Value < 1) { hadMotion = true; Render(); return active || renderRequested; }
    double searchBefore = searchReveal.Value;
    searchReveal.Target = (searchActive || pickerMode) && !pickerMode ? 1 : 0;
    active |= searchReveal.Step(dt);
    if (Math.Abs(searchReveal.Value - searchBefore) > 0.0001) LayoutContent(false);
    active |= scroll.Step(dt);
-   if (scrollbarHold > 0) { scrollbarHold -= dt; scrollbar.Target = 1; active = true; } else scrollbar.Target = 0;
+   bool holdingScrollbar = scrollbarHold > 0;
+   if (holdingScrollbar) scrollbarHold -= dt;
+   scrollbar.Target = holdingScrollbar ? 1 : 0;
    active |= scrollbar.Step(dt);
    active |= titleReveal.Step(dt);
    titleHover.Target = !pickerMode && TitleRect().Contains(mouseClient) && !editing ? 1 : 0;
@@ -349,13 +776,20 @@ namespace MacDeskNative {
    for (int i = 0; i < tiles.Count; i++) {
     TileView t = tiles[i];
     bool selected = t.Entry != null && t.Entry.Item.id == selectedId && (searchActive || keyboardSelection);
-    t.Scale.Target = t == pressedTile ? 0.86 : (t == hoveredTile ? 1.07 : 1.0);
+    // Hover never rescales the bitmap icon (sub-pixel resampling makes it shimmer); it raises
+    // a vector highlight plate instead. Only a press shrinks the icon, in whole pixels.
+    t.Scale.Target = t == pressedTile ? 0.86 : 1.0;
+    t.Hover.Target = t == liveDrag || (t == hoveredTile && !draggingItem) ? 1 : 0;
     t.Select.Target = selected ? 1 : 0;
-    t.Fade.Target = (draggingItem && i == dragSourceTileIndex) ? 0.35 : 1;
-    foreach (var s in t.Springs) active |= s.Step(dt);
+    t.Fade.Target = (draggingItem && liveDrag == null && i == dragSourceTileIndex) ? 0.35 : 1;
+    if (t == liveDrag) { t.X.Snap(liveX); t.Y.Snap(liveY); } // the lifted icon follows the pointer exactly
+    active |= t.Step(dt);
+    if (t == liveDrag) active = true;
    }
-   Render();
-   return active;
+   // Draw the settling frame, then leave static pixels alone during the scrollbar's hold.
+   if (requested || active || hadMotion) Render();
+   hadMotion = active;
+   return active || holdingScrollbar || renderRequested;
   }
   private bool keyboardSelection;
 
@@ -364,6 +798,10 @@ namespace MacDeskNative {
   internal Bench.Stat[] Bench() {
    IntPtr h = Handle;
    const double dt = 1 / 240.0;
+   string shots = Environment.GetEnvironmentVariable("MACDESK_BENCH_FRAMES");
+   LayoutContent(true);
+   Render();
+   if (shots != null) surface.SaveSnapshot(System.IO.Path.Combine(shots, "panel.png"));
    EnterPickerMode();
    LayoutContent(true);
    Render();
@@ -382,34 +820,81 @@ namespace MacDeskNative {
     Tick(dt);
    });
    hoveredTile = null;
-   return new[] { scrollStat, hoverStat };
+   // Live reorder: pick up icon #1, carry it onto cell #3, hold, then onto cell #6, hold, drop.
+   // With MACDESK_BENCH_FRAMES=<dir> every 8th frame is saved as a PNG for visual review.
+   var stats = new List<Bench.Stat> { scrollStat, hoverStat };
+   string frameDir = Environment.GetEnvironmentVariable("MACDESK_BENCH_FRAMES");
+   for (int i = 0; i < 40; i++) Tick(dt);
+   TileView first = tiles.Find(t => t.Entry != null);
+   int movableCount = tiles.FindAll(t => !t.IsPlus).Count;
+   if (first != null && movableCount >= 6) {
+    string firstId = first.Entry.Item.id;
+    Point start = CellIconCenter(0);
+    BeginLiveDrag(first, start, start);
+    var path = new List<Point>();
+    Point a = CellIconCenter(2), b = CellIconCenter(5);
+    for (int i = 1; i <= 40; i++) path.Add(Lerp(start, a, i / 40f));
+    for (int i = 0; i < 50; i++) path.Add(a);
+    for (int i = 1; i <= 40; i++) path.Add(Lerp(a, b, i / 40f));
+    for (int i = 0; i < 50; i++) path.Add(b);
+    int n = 0;
+    stats.Add(MacDeskNative.Bench.Time("panel live reorder drag", path.Count, delegate {
+     UpdateLiveDrag(path[n]);
+     Tick(dt);
+     if (frameDir != null && n % 8 == 0) surface.SaveSnapshot(System.IO.Path.Combine(frameDir, "drag_" + n.ToString("000") + ".png"));
+     n++;
+    }));
+    EndLiveDrag(b);
+    for (int i = 0; i < 90; i++) { Tick(dt); if (frameDir != null && i % 15 == 0) surface.SaveSnapshot(System.IO.Path.Combine(frameDir, "drop_" + i.ToString("000") + ".png")); }
+    int now = group.items.FindIndex(v => v.id == firstId);
+    var result = new Bench.Stat("panel reorder: #1 -> slot 6 " + (now == 5 ? "OK" : "WRONG(" + now + ")"));
+    result.Add(0);
+    stats.Add(result);
+   }
+   int key = 0;
+   stats.Add(MacDeskNative.Bench.Time("folder type-to-search", 64, delegate {
+    int index = key++ % 4;
+    if (index == 3) HandleKey(Keys.Escape);
+    else HandleChar("app"[index]);
+    Tick(dt);
+   }));
+   return stats.ToArray();
   }
+
+  private Point CellIconCenter(int slot) {
+   Rectangle view = GridViewport();
+   float left = FolderLayout.GridLeft(view, gridColumns);
+   return new Point((int)(left + (slot % gridColumns) * (CellW + GapX) + CellW / 2f), (int)(view.Y + (slot / gridColumns) * (CellH + GapY) - (float)scroll.Value + 8 + IconPx / 2f));
+  }
+  private static Point Lerp(Point a, Point b, float t) { return new Point((int)Math.Round(a.X + (b.X - a.X) * t), (int)Math.Round(a.Y + (b.Y - a.Y) * t)); }
+
 
   // --- Rendering ------------------------------------------------------------------------
 
+  // One renderer for every frame: the transition (p < 1) and the open panel (p = 1) are drawn
+  // into the same window from the same geometry. The window follows the painted content.
   private void Render() {
-   if (IsDisposed || Disposing || !IsHandleCreated || ClientSize.Width < 2 || ClientSize.Height < 2) return;
-   var g = surface.Begin(ClientSize);
-   surface.Clear(new Rectangle(Point.Empty, ClientSize));
-   Ui.PrepareQuality(g);
-   RenderCanvas(g, false);
-   surface.Present(Handle, null, 255, null);
+   if (IsDisposed || Disposing || !IsHandleCreated || work.Width < 2 || work.Height < 2) return;
+   TransitionFrame transition = progress.Value < 1.0 ? Geometry(progress.Value) : null;
+   Rectangle panelArea = Rectangle.Inflate(new Rectangle(origin, panelSize), 40, 40);
+   Rectangle workBounds = new Rectangle(Point.Empty, work.Size);
+   Rectangle nextCanvas = Rectangle.Intersect(transition != null ? TransitionArea(transition) : panelArea, workBounds);
+   if (nextCanvas.Width < 1 || nextCanvas.Height < 1) return;
+   canvas = nextCanvas;
+   surface.Reserve(Rectangle.Intersect(panelArea, workBounds).Size);
+   var g = surface.Begin(canvas.Size);
+   surface.Clear(new Rectangle(Point.Empty, canvas.Size));
+   g.TranslateTransform(-canvas.X, -canvas.Y);
+   if (transition != null) DrawTransition(g, transition);
+   else {
+    g.TranslateTransform(origin.X, origin.Y);
+    RenderCanvas(g, false);
+   }
+   g.ResetTransform();
+   g.ResetClip();
+   surface.Present(Handle, new Point(work.X + canvas.X, work.Y + canvas.Y), 255, null);
   }
 
-  // Sheet-sized snapshot of the icons + labels only (transparent), for the morph layer.
-  internal Bitmap MotionSnapshot() {
-   LayoutContent(true);
-   Rectangle sheet = SheetRect();
-   var result = new Bitmap(Math.Max(1, sheet.Width), Math.Max(1, sheet.Height), System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-   using (Graphics g = Graphics.FromImage(result)) {
-    g.Clear(Color.Transparent);
-    Ui.PrepareQuality(g);
-    g.TranslateTransform(0, -TitleBand);
-    g.SetClip(GridClip());
-    DrawGrid(g, true);
-   }
-   return result;
-  }
   private Rectangle GridClip() {
    Rectangle sheet = SheetRect(), view = GridViewport();
    return Rectangle.FromLTRB(sheet.Left + 6, view.Top - 6, sheet.Right - 6, sheet.Bottom - 8);
@@ -439,7 +924,7 @@ namespace MacDeskNative {
     float barH = Math.Max(30f, view.Height * ratio);
     float maxScroll = Math.Max(1f, contentHeight - view.Height);
     float barY = view.Y + (view.Height - barH) * (float)(scroll.Value / maxScroll);
-    var bar = new RectangleF(ClientSize.Width - 11, barY, 4.5f, barH);
+    var bar = new RectangleF(PanelSize.Width - 11, barY, 4.5f, barH);
     using (var path = Ui.Squircle(bar, 2.25f))
     using (var brush = new SolidBrush(Color.FromArgb((int)(150 * scrollbar.Value), 255, 255, 255))) g.FillPath(brush, path);
    }
@@ -452,8 +937,8 @@ namespace MacDeskNative {
   private TextureBrush sheetCacheMaterial;
   private string titleCacheText;
   // Shared by every folder panel (and the picker): an icon or label is rendered once per process.
-  private static readonly Dictionary<string, Bitmap> iconCache = new Dictionary<string, Bitmap>();
-  private static readonly Dictionary<string, Bitmap> labelCache = new Dictionary<string, Bitmap>();
+  private static readonly BitmapCache iconCache = new BitmapCache(384);
+  private static readonly BitmapCache labelCache = new BitmapCache(384);
   private readonly System.Drawing.Imaging.ImageAttributes blitAttributes = new System.Drawing.Imaging.ImageAttributes();
   private readonly System.Drawing.Imaging.ColorMatrix blitMatrix = new System.Drawing.Imaging.ColorMatrix();
   private readonly HashSet<string> groupTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -467,16 +952,28 @@ namespace MacDeskNative {
   }
 
   private void DrawSheetBackground(Graphics g) {
-   Point screen = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
-   if (sheetCache == null || sheetCache.Size != ClientSize || sheetCacheOrigin != screen || sheetCacheMaterial != material) {
+   EnsureSheetCache();
+   var mode = g.CompositingMode;
+   g.CompositingMode = CompositingMode.SourceCopy;
+   Ui.Blit(g, sheetCache, 0, 0);
+   g.CompositingMode = mode;
+  }
+
+  // The frosted sheet depends on the backdrop captured for this open, so it is rebuilt once per
+  // open (a few ms). Open() builds it before the first frame, while the folder still looks like
+  // its desktop icon, so the landing frame never pays for it.
+  private void EnsureSheetCache() {
+   Point screen = PanelScreenRect().Location;
+   EnsureMaterial();
+   if (sheetCache == null || sheetCache.Size != PanelSize || sheetCacheOrigin != screen || sheetCacheMaterial != material) {
     if (sheetCache != null) sheetCache.Dispose();
-    sheetCache = new Bitmap(Math.Max(1, ClientSize.Width), Math.Max(1, ClientSize.Height), System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+    sheetCache = new Bitmap(Math.Max(1, PanelSize.Width), Math.Max(1, PanelSize.Height), System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
     using (var cg = Graphics.FromImage(sheetCache)) {
      cg.Clear(Color.Transparent);
      Ui.PrepareQuality(cg);
      // The transparent band above the sheet still catches clicks (alpha 1/255): clicking
      // there closes the folder instead of falling through to whatever is underneath.
-     using (var catcher = new SolidBrush(Color.FromArgb(1, 0, 0, 0))) cg.FillRectangle(catcher, 0, 0, ClientSize.Width, TitleBand);
+     using (var catcher = new SolidBrush(Color.FromArgb(1, 0, 0, 0))) cg.FillRectangle(catcher, 0, 0, PanelSize.Width, TitleBand);
      Rectangle sheet = SheetRect();
      using (var shape = Ui.Squircle(sheet, SheetRadius)) {
       if (material != null) {
@@ -490,49 +987,71 @@ namespace MacDeskNative {
     sheetCacheOrigin = screen;
     sheetCacheMaterial = material;
    }
-   var mode = g.CompositingMode;
-   g.CompositingMode = CompositingMode.SourceCopy;
-   Ui.Blit(g, sheetCache, 0, 0);
-   g.CompositingMode = mode;
   }
 
-  private Bitmap CachedIcon(DeskItem item) {
+  // Shared with the desktop folder's 3x3 preview, so the mini icons on the desktop and the ones
+  // that fly out of it are the same pixels' source.
+  internal static Bitmap CachedIcon(DeskItem item) {
    string key = item.type + "|" + item.target + "|" + item.icon;
-   Bitmap bmp;
-   if (iconCache.TryGetValue(key, out bmp)) return bmp;
-   Image source = null;
-   try { source = IconProvider.Get(item); } catch { }
-   if (source == null) return null;
-   if (iconCache.Count > 400) ClearCache(iconCache);
-   bmp = new Bitmap(IconPx, IconPx, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-   using (var cg = Graphics.FromImage(bmp)) {
-    cg.Clear(Color.Transparent);
-    Ui.PrepareQuality(cg);
-    cg.DrawImage(source, new Rectangle(0, 0, IconPx, IconPx));
+   Bitmap bmp = iconCache.Get(key);
+   if (bmp != null) return bmp;
+   Image source;
+   try { source = IconProvider.Load(item); } catch { return null; }
+   using (source) {
+    bmp = new Bitmap(IconPx, IconPx, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+    using (var cg = Graphics.FromImage(bmp)) {
+     Ui.PrepareQuality(cg);
+     cg.DrawImage(source, new Rectangle(0, 0, IconPx, IconPx));
+    }
    }
-   iconCache[key] = bmp;
+   iconCache.Add(key, bmp);
    return bmp;
   }
 
   private Bitmap CachedLabel(string text, string sub, float bakedAlpha) {
-   string key = (text ?? "") + "\u0001" + (sub ?? "") + "\u0001" + bakedAlpha.ToString("0.00");
-   Bitmap bmp;
-   if (labelCache.TryGetValue(key, out bmp)) return bmp;
-   if (labelCache.Count > 400) ClearCache(labelCache);
+   string key = (bakedAlpha < 1 ? "+" : "-") + (text ?? "") + "\u0001" + (sub ?? "");
+   Bitmap bmp = labelCache.Get(key);
+   if (bmp != null) return bmp;
    bmp = new Bitmap(CellW + 12, 36, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
    using (var cg = Graphics.FromImage(bmp))
    using (var f = Ui.TopCentered()) {
     cg.Clear(Color.Transparent);
     Ui.PrepareQuality(cg);
-    var r = new RectangleF(8, 0, CellW - 4, 19);
-    Ui.SoftText(cg, text ?? "", labelFont, Ui.Label, r, f, 0.95f * bakedAlpha);
-    if (sub != null) using (var b = new SolidBrush(Ui.WithAlpha(Ui.SecondaryLabel, bakedAlpha))) cg.DrawString(sub, subLabelFont, b, new RectangleF(8, 19, CellW - 4, 15), f);
+    var r = new RectangleF(8, 0, CellW - 4, 20);
+    TextStyle.DrawShadowed(cg, text ?? "", Ui.Cjk, FontStyle.Regular, 13f, Ui.WithAlpha(Ui.Label, 0.97 * bakedAlpha), r, f, 0.4f, 0.45f);
+    if (sub != null) TextStyle.Draw(cg, sub, Ui.Cjk, FontStyle.Regular, 11f, Ui.WithAlpha(Ui.SecondaryLabel, bakedAlpha), new RectangleF(8, 19, CellW - 4, 16), f, 0.25f);
    }
-   labelCache[key] = bmp;
+   labelCache.Add(key, bmp);
    return bmp;
   }
 
-  private static void ClearCache(Dictionary<string, Bitmap> cache) { foreach (var b in cache.Values) b.Dispose(); cache.Clear(); }
+  private sealed class BitmapCache {
+   private readonly int capacity;
+   private readonly Dictionary<string, LinkedListNode<KeyValuePair<string, Bitmap>>> entries;
+   private readonly LinkedList<KeyValuePair<string, Bitmap>> recent = new LinkedList<KeyValuePair<string, Bitmap>>();
+
+   internal BitmapCache(int capacity) {
+    this.capacity = capacity;
+    entries = new Dictionary<string, LinkedListNode<KeyValuePair<string, Bitmap>>>(capacity, StringComparer.Ordinal);
+   }
+
+   internal Bitmap Get(string key) {
+    LinkedListNode<KeyValuePair<string, Bitmap>> entry;
+    if (!entries.TryGetValue(key, out entry)) return null;
+    if (entry != recent.First) { recent.Remove(entry); recent.AddFirst(entry); }
+    return entry.Value.Value;
+   }
+
+   internal void Add(string key, Bitmap bitmap) {
+    if (entries.Count == capacity) {
+     var oldest = recent.Last.Value;
+     entries.Remove(oldest.Key);
+     recent.RemoveLast();
+     oldest.Value.Dispose();
+    }
+    entries.Add(key, recent.AddFirst(new KeyValuePair<string, Bitmap>(key, bitmap)));
+   }
+  }
 
   private void Blit(Graphics g, Bitmap bmp, float x, float y, float alpha) {
    Ui.Blit(g, bmp, (int)Math.Round(x), (int)Math.Round(y), alpha, blitAttributes, blitMatrix);
@@ -552,6 +1071,10 @@ namespace MacDeskNative {
     using (var path = Ui.Squircle(r, r.Height / 2f))
     using (var brush = new SolidBrush(Color.FromArgb((int)(38 * titleHover.Value * a), 255, 255, 255))) g.FillPath(brush, path);
    }
+   Blit(g, EnsureTitleCache(r), r.X - 4, r.Y - 2, a);
+  }
+
+  private Bitmap EnsureTitleCache(Rectangle r) {
    string text = TitleText();
    if (titleCache == null || titleCacheText != text || titleCache.Width != r.Width + 8) {
     if (titleCache != null) titleCache.Dispose();
@@ -559,11 +1082,11 @@ namespace MacDeskNative {
     using (var cg = Graphics.FromImage(titleCache)) using (var f = Ui.Centered(true)) {
      cg.Clear(Color.Transparent);
      Ui.PrepareQuality(cg);
-     Ui.ShadowText(cg, text, titleFont, Ui.Label, new RectangleF(4, 4, r.Width, r.Height), f, 1f);
+     TextStyle.DrawShadowed(cg, text, Ui.Cjk, FontStyle.Bold, 24f, Ui.Label, new RectangleF(4, 4, r.Width, r.Height), f, 0.2f, 0.9f);
     }
     titleCacheText = text;
    }
-   Blit(g, titleCache, r.X - 4, r.Y - 2 + (1 - a) * 8, a);
+   return titleCache;
   }
 
   private void DrawPickerHeader(Graphics g) {
@@ -614,22 +1137,31 @@ namespace MacDeskNative {
 
   private void DrawGrid(Graphics g, bool snapshot) {
    float scrollY = (float)scroll.Value;
+   Rectangle clip = GridClip();
    TileView top = null;
+   TileView lifted = snapshot ? null : liveDrag;
    for (int i = 0; i < tiles.Count; i++) {
+    if (tiles[i] == lifted) continue;
     if (!snapshot && tiles[i] == pressedTile) { top = tiles[i]; continue; }
+    float y = (snapshot ? tiles[i].Target.Y : tiles[i].Y.F) - scrollY;
+    if (y > clip.Bottom || y + CellH + 16 < clip.Top) continue;
     DrawTile(g, tiles[i], snapshot, scrollY);
    }
    if (top != null) DrawTile(g, top, snapshot, scrollY);
+   if (lifted != null) DrawTile(g, lifted, snapshot, scrollY); // the carried icon floats above all
   }
 
   private void DrawTile(Graphics g, TileView tile, bool snapshot, float scrollY) {
    float x = snapshot ? tile.Target.X : tile.X.F, y = (snapshot ? tile.Target.Y : tile.Y.F) - scrollY;
-   if (y > ClientSize.Height || y + CellH < TitleBand) return;
+   if (y > PanelSize.Height || y + CellH < TitleBand) return;
    float scale = snapshot ? 1f : tile.Scale.F;
    float fade = snapshot ? 1f : Math.Max(0f, Math.Min(1f, tile.Fade.F));
-   float size = IconPx * scale;
-   var icon = new RectangleF(x + (CellW - size) / 2f, y + 8 + (IconPx - size) / 2f, size, size);
-   float radius = size * 0.2237f;
+   // Bitmap icons are only ever drawn at whole-pixel positions and even whole-pixel sizes
+   // (centred), so their edges never land on half pixels and shimmer while animating.
+   float cxf = x + CellW / 2f, cyf = y + Metrics.IconTop + IconPx / 2f;
+   Rectangle iconBox = FolderLayout.IconInCell(x, y, scale);
+   int sizeInt = iconBox.Width, ix = iconBox.X, iy = iconBox.Y;
+   var icon = new RectangleF(ix, iy, sizeInt, sizeInt);
 
    if (!snapshot && tile.Select.Value > 0.01) {
     var hl = new RectangleF(x + 4, y + 1, CellW - 8, CellH - 4);
@@ -637,35 +1169,26 @@ namespace MacDeskNative {
     using (var b = new SolidBrush(Color.FromArgb((int)(40 * tile.Select.Value), 255, 255, 255))) g.FillPath(b, path);
    }
 
+   if (!snapshot && tile.Hover.Value > 0.005) {
+    // Hover: a soft glass plate rises behind the icon (vector, so it animates smoothly).
+    float h = (float)Math.Min(1.0, tile.Hover.Value);
+    float grow = 5f + 4f * h;
+    var plate = new RectangleF(cxf - IconPx / 2f - grow, cyf - IconPx / 2f - grow, IconPx + grow * 2, IconPx + grow * 2);
+    float pr = IconPx * 0.2237f + grow * 0.8f;
+    using (var path = Ui.Squircle(plate, pr))
+    using (var b = new SolidBrush(Color.FromArgb((int)(34 * h), 255, 255, 255))) g.FillPath(b, path);
+    Material.Rim(g, plate, pr, 0.55f * h);
+   }
+
    if (tile.IsPlus) {
-    using (var path = Ui.Squircle(icon, radius))
-    using (var b = new SolidBrush(Color.FromArgb((int)(36 * fade), 255, 255, 255)))
-    using (var pen = new Pen(Color.FromArgb((int)(70 * fade), 255, 255, 255), 1f)) { g.FillPath(b, path); g.DrawPath(pen, path); }
-    float arm = size * 0.2f, cx = icon.X + icon.Width / 2, cy = icon.Y + icon.Height / 2;
-    using (var pen = new Pen(Color.FromArgb((int)(235 * fade), 255, 255, 255), 2.6f)) {
-     pen.StartCap = pen.EndCap = LineCap.Round;
-     g.DrawLine(pen, cx - arm, cy, cx + arm, cy);
-     g.DrawLine(pen, cx, cy - arm, cx, cy + arm);
-    }
+    DrawPlusGlyph(g, icon, fade);
     DrawLabel(g, "添加", null, x, y + 8 + IconPx, fade, 0.85f);
     return;
    }
 
    PanelEntry entry = tile.Entry;
    if (entry == null) return;
-   Bitmap image = CachedIcon(entry.Item);
-   if (image != null) {
-    if (Math.Abs(scale - 1f) < 0.004f) Blit(g, image, icon.X, icon.Y, fade);
-    else {
-     // Only the one or two tiles mid-spring take this path: resample the 128 px original so
-     // a hover-enlarged icon stays crisp.
-     Image source = null;
-     try { source = IconProvider.Get(entry.Item); } catch { }
-     if (source == null) source = image;
-     if (fade >= 0.99f) g.DrawImage(source, icon);
-     else using (var ia = Alpha(fade)) g.DrawImage(source, new[] { new PointF(icon.Left, icon.Top), new PointF(icon.Right, icon.Top), new PointF(icon.Left, icon.Bottom) }, new RectangleF(0, 0, source.Width, source.Height), GraphicsUnit.Pixel, ia);
-    }
-   }
+   Ui.DrawIcon(g, CachedIcon(entry.Item), iconBox, fade, blitAttributes, blitMatrix);
 
    if (!snapshot && pickerMode) {
     bool inGroup = entry.Item.target != null && groupTargets.Contains(entry.Item.target);
@@ -695,32 +1218,18 @@ namespace MacDeskNative {
    Blit(g, CachedLabel(text, sub, baked), cellX - 6, iconBottom + 6, alpha);
   }
 
-  private static System.Drawing.Imaging.ImageAttributes Alpha(float a) {
-   var cm = new System.Drawing.Imaging.ColorMatrix { Matrix33 = Math.Max(0f, Math.Min(1f, a)) };
-   var ia = new System.Drawing.Imaging.ImageAttributes();
-   ia.SetColorMatrix(cm);
-   return ia;
-  }
-
   protected override void OnPaint(PaintEventArgs e) { }
   protected override void OnPaintBackground(PaintEventArgs e) { }
 
   // --- Window lifecycle -----------------------------------------------------------------
 
   private void ResizeAroundCenter(Size nextSize) {
-   Rectangle work = Screen.FromControl(this).WorkingArea;
-   int cx = Left + Width / 2;
-   int cy = Top + Height / 2;
-   int nx = Math.Max(work.Left + 12, Math.Min(work.Right - nextSize.Width - 12, cx - nextSize.Width / 2));
-   int ny = Math.Max(work.Top + 12, Math.Min(work.Bottom - nextSize.Height - 12, cy - nextSize.Height / 2));
-   Bounds = new Rectangle(nx, ny, nextSize.Width, nextSize.Height);
+   int cx = origin.X + panelSize.Width / 2, cy = origin.Y + panelSize.Height / 2;
+   panelSize = nextSize;
+   origin = new Point(Math.Max(12, Math.Min(work.Width - nextSize.Width - 12, cx - nextSize.Width / 2)), Math.Max(12, Math.Min(work.Height - nextSize.Height - 12, cy - nextSize.Height / 2)));
+   EnsureMaterial();
    LayoutContent(true);
    Render();
-  }
-
-  protected override void OnSizeChanged(EventArgs e) {
-   base.OnSizeChanged(e);
-   LayoutContent(true);
   }
 
   protected override void OnVisibleChanged(EventArgs e) {
@@ -743,7 +1252,7 @@ namespace MacDeskNative {
 
   private TileView HitTile(Point p) {
    Rectangle view = GridViewport();
-   if (!Rectangle.FromLTRB(view.Left, view.Top - 4, view.Right, Math.Max(view.Bottom, ClientSize.Height - 8)).Contains(p)) return null;
+   if (!Rectangle.FromLTRB(view.Left, view.Top - 4, view.Right, Math.Max(view.Bottom, PanelSize.Height - 8)).Contains(p)) return null;
    for (int i = 0; i < tiles.Count; i++) {
     TileView t = tiles[i];
     var r = new RectangleF(t.X.F, t.Y.F - (float)scroll.Value, CellW, CellH);
@@ -754,7 +1263,11 @@ namespace MacDeskNative {
 
   protected override void OnMouseMove(MouseEventArgs e) {
    base.OnMouseMove(e);
+   if (progress.Value < 1 || IsClosing) return;
+   e = ToPanel(e);
+   Point previous = mouseClient;
    mouseClient = e.Location;
+   if (liveDrag != null) { UpdateLiveDrag(e.Location); return; }
    if (!pickerMode && mouseArmed && pressedTile != null && !pressedTile.IsPlus && e.Button == MouseButtons.Left) {
     Size threshold = new Size(14, 14); // generous: a slightly shaky click must still launch
     Rectangle allowed = new Rectangle(mouseDownPoint.X - threshold.Width / 2, mouseDownPoint.Y - threshold.Height / 2, threshold.Width, threshold.Height);
@@ -762,7 +1275,8 @@ namespace MacDeskNative {
      mouseArmed = false;
      TileView dragTile = pressedTile;
      pressedTile = null;
-     StartItemDrag(dragTile);
+     if (dragTile.Entry != null && !dragTile.Entry.IsCrossGroup) BeginLiveDrag(dragTile, mouseDownPoint, e.Location);
+     else StartItemDrag(dragTile);
      return;
     }
    }
@@ -770,9 +1284,15 @@ namespace MacDeskNative {
    bool overButton = pickerMode
     ? (PickerDoneBounds().Contains(e.Location) || PickerFileBounds().Contains(e.Location) || PickerFolderBounds().Contains(e.Location))
     : TitleRect().Contains(e.Location);
-   if (hit != hoveredTile) hoveredTile = hit;
+   bool changed = hit != hoveredTile;
+   hoveredTile = hit;
    Cursor = (hit != null || overButton) ? Cursors.Hand : Cursors.Default;
-   WakeAnimation();
+   if (pickerMode) {
+    changed |= PickerDoneBounds().Contains(previous) != PickerDoneBounds().Contains(e.Location);
+    changed |= PickerFileBounds().Contains(previous) != PickerFileBounds().Contains(e.Location);
+    changed |= PickerFolderBounds().Contains(previous) != PickerFolderBounds().Contains(e.Location);
+   } else changed |= TitleRect().Contains(previous) != overButton;
+   if (changed) WakeAnimation();
   }
 
   protected override void OnMouseLeave(EventArgs e) {
@@ -785,6 +1305,9 @@ namespace MacDeskNative {
 
   protected override void OnMouseDown(MouseEventArgs e) {
    base.OnMouseDown(e);
+   if (progress.Target < 1) return;
+   CompleteOpening(); // a click while it is still opening lands it at once
+   e = ToPanel(e);
    if (editing) CommitInlineRename(true);
    keyboardSelection = false;
    TileView hit = HitTile(e.Location);
@@ -797,7 +1320,80 @@ namespace MacDeskNative {
    WakeAnimation();
   }
 
+  // --- Live reorder: the icon is picked up and follows the pointer; neighbours slide aside ---
+
+  private TileView liveDrag;
+  private float liveX, liveY;
+  private PointF liveGrab;
+
+  private void BeginLiveDrag(TileView tile, Point down, Point now) {
+   liveDrag = tile;
+   draggingItem = true;
+   dragSourceTileIndex = tile.SlotIndex;
+   dragHoverInsertIndex = tile.SlotIndex;
+   liveGrab = new PointF(down.X - tile.X.F, down.Y - (tile.Y.F - (float)scroll.Value));
+   hoveredTile = null;
+   Capture = true;
+   Cursor = Cursors.SizeAll;
+   UpdateLiveDrag(now);
+  }
+
+  private void UpdateLiveDrag(Point p) {
+   TileView tile = liveDrag;
+   if (tile == null) return;
+   // Carried out of the folder: hand over to a system drag so it can land on another folder.
+   Rectangle inside = new Rectangle(-24, TitleBand - 24, PanelSize.Width + 48, PanelSize.Height - TitleBand + 48);
+   if (!inside.Contains(p)) {
+    EndLiveDrag(null);
+    StartItemDrag(tile);
+    return;
+   }
+   liveX = p.X - liveGrab.X;
+   liveY = p.Y - liveGrab.Y + (float)scroll.Value;
+   Rectangle view = GridViewport();
+   float edge = p.Y < view.Top + 30 ? -10f : (p.Y > view.Bottom - 30 ? 10f : 0f);
+   if (edge != 0f) {
+    float maxScroll = Math.Max(0f, contentHeight - view.Height);
+    scroll.Target = Math.Max(0f, Math.Min(maxScroll, scroll.Target + edge));
+   }
+   var center = new PointF(liveX + CellW / 2f, liveY - (float)scroll.Value + 8 + IconPx / 2f);
+   int slot = LiveSlotAt(center, dragHoverInsertIndex);
+   if (slot >= 0 && slot != dragHoverInsertIndex) {
+    dragHoverInsertIndex = slot;
+    LayoutContent(false); // neighbours get new spring targets and glide into place
+   }
+   WakeAnimation();
+  }
+
+  // drop == null cancels (no change); otherwise commits the order shown on screen.
+  private void EndLiveDrag(Point? drop) {
+   TileView tile = liveDrag;
+   if (tile == null) return;
+   // Commit exactly the arrangement on screen (the gap the user sees), not a re-hit-test.
+   int slot = dragHoverInsertIndex;
+   int modelInsert = ModelInsertForSlot(slot);
+   bool commit = drop.HasValue && slot >= 0 && slot != dragSourceTileIndex && modelInsert >= 0 && tile.Entry != null;
+   string itemId = tile.Entry != null ? tile.Entry.Item.id : null;
+   liveDrag = null;
+   draggingItem = false;
+   dragSourceTileIndex = -1;
+   dragHoverInsertIndex = -1;
+   Capture = false;
+   Cursor = Cursors.Default;
+   if (commit && app.TryMoveItem(groupId, itemId, groupId, modelInsert)) RefreshData(); // tiles keep their springs and fly to the new order
+   else LayoutContent(false); // springs carry the icon back to its slot
+   WakeAnimation();
+  }
+
+  protected override void OnMouseCaptureChanged(EventArgs e) {
+   base.OnMouseCaptureChanged(e);
+   if (!Capture && liveDrag != null) EndLiveDrag(null);
+  }
+
   protected override void OnMouseUp(MouseEventArgs e) {
+   if (progress.Target < 1) { base.OnMouseUp(e); return; }
+   e = ToPanel(e);
+   if (liveDrag != null && e.Button == MouseButtons.Left) { EndLiveDrag(e.Location); base.OnMouseUp(e); return; }
    base.OnMouseUp(e);
    TileView activePress = pressedTile;
    bool wasArmed = mouseArmed;
@@ -894,7 +1490,7 @@ namespace MacDeskNative {
    searchQuery = "";
    scroll.Snap(0);
    RefreshData();
-   ResizeAroundCenter(GetExpandedSize(new Point(Left + Width / 2, Top + Height / 2)));
+   ResizeAroundCenter(ComputePanelSize());
   }
 
   private void ExitPickerMode() {
@@ -905,7 +1501,7 @@ namespace MacDeskNative {
    searchReveal.Snap(0);
    scroll.Snap(0);
    RefreshData();
-   ResizeAroundCenter(GetExpandedSize(new Point(Left + Width / 2, Top + Height / 2)));
+   ResizeAroundCenter(ComputePanelSize());
   }
 
   internal void FocusSearch() {
@@ -948,7 +1544,8 @@ namespace MacDeskNative {
   private void PlaceIme() {
    RectangleF r = editing ? EditFieldRect() : SearchRect();
    if (r.IsEmpty || app.DesktopFolders == null) return;
-   app.DesktopFolders.PlaceImeWindow(PointToScreen(new Point((int)r.X + 12, (int)r.Bottom + 2)));
+   Rectangle panel = PanelScreenRect();
+   app.DesktopFolders.PlaceImeWindow(new Point(panel.X + (int)r.X + 12, panel.Y + (int)r.Bottom + 2));
   }
 
   private void DrawEditField(Graphics g, RectangleF r, Font font) {
@@ -1097,8 +1694,7 @@ namespace MacDeskNative {
    foreach (var t in tiles) if (!t.IsPlus) movable++;
    int bestSlot = movable;
    float bestDist = float.MaxValue;
-   int usedW = gridColumns * CellW + (gridColumns - 1) * GapX;
-   float left = view.X + (view.Width - usedW) * 0.5f;
+   float left = FolderLayout.GridLeft(view, gridColumns);
    for (int i = 0; i < movable; i++) {
     // Compare against the unshifted logical slot so the live reflow cannot oscillate.
     float sx = left + (i % gridColumns) * (CellW + GapX) + CellW * 0.5f;
@@ -1106,15 +1702,38 @@ namespace MacDeskNative {
     float d = (client.X - sx) * (client.X - sx) + (client.Y - sy) * (client.Y - sy);
     if (d < bestDist) { bestDist = d; bestSlot = i; }
    }
-   // Map the visual slot back to the folder's real item index. Slots are positions in the
-   // (possibly search-filtered) list, so they must never be used as model indices directly.
-   if (bestSlot >= 0 && bestSlot < filtered.Count && filtered[bestSlot].GroupId == groupId) {
-    int target = filtered[bestSlot].Index;
-    bool sameFolderDrag = dragSourceTileIndex >= 0 && dragSourceTileIndex < filtered.Count && filtered[dragSourceTileIndex].GroupId == groupId;
-    // Same-folder reorder: TryMoveItem decrements insertIndex when old < insertIndex.
-    modelInsertIndex = sameFolderDrag && filtered[dragSourceTileIndex].Index < target ? target + 1 : target;
-   }
+   modelInsertIndex = ModelInsertForSlot(bestSlot);
    return bestSlot;
+  }
+
+  // Map a visual slot back to the folder's real item index. Slots are positions in the
+  // (possibly search-filtered) list, so they must never be used as model indices directly.
+  private int ModelInsertForSlot(int slot) {
+   if (slot < 0 || slot >= filtered.Count || filtered[slot].GroupId != groupId) return -1;
+   int target = filtered[slot].Index;
+   bool sameFolderDrag = dragSourceTileIndex >= 0 && dragSourceTileIndex < filtered.Count && filtered[dragSourceTileIndex].GroupId == groupId;
+   // Same-folder reorder: TryMoveItem decrements insertIndex when old < insertIndex.
+   return sameFolderDrag && filtered[dragSourceTileIndex].Index < target ? target + 1 : target;
+  }
+
+  // Live reorder target, iOS style: the gap moves only once the carried icon's centre is
+  // clearly inside another cell (cells shrunk by a margin = hysteresis), so hovering near a
+  // border never makes the neighbours shuffle back and forth. Past the last icon = last slot.
+  private int LiveSlotAt(PointF center, int current) {
+   Rectangle view = GridViewport();
+   int movable = 0;
+   foreach (var t in tiles) if (!t.IsPlus) movable++;
+   if (movable == 0) return current;
+   float left = FolderLayout.GridLeft(view, gridColumns), top = view.Y - (float)scroll.Value;
+   RectangleF last = RectangleF.Empty;
+   for (int i = 0; i < movable; i++) {
+    var cell = new RectangleF(left + (i % gridColumns) * (CellW + GapX), top + (i / gridColumns) * (CellH + GapY), CellW, CellH);
+    last = cell;
+    cell.Inflate(-16, -18);
+    if (cell.Contains(center)) return i;
+   }
+   if (center.Y > last.Bottom || (center.Y > last.Top && center.X > last.Right)) return movable - 1;
+   return current;
   }
 
   private void DragOverContent(object sender, DragEventArgs e) {
@@ -1122,7 +1741,7 @@ namespace MacDeskNative {
    try {
     DropPayload payload = ReadDropPayload(e.Data, e.AllowedEffect);
     if (payload == null) { ClearDropFeedback(); return; }
-    Point client = PointToClient(new Point(e.X, e.Y));
+    Point client = ToPanel(PointToClient(new Point(e.X, e.Y)));
     Rectangle view = GridViewport();
     if (view.Contains(client)) {
      float delta = client.Y < view.Top + 28 ? -14f : (client.Y > view.Bottom - 28 ? 14f : 0f);
@@ -1152,7 +1771,7 @@ namespace MacDeskNative {
     DropPayload payload = ReadDropPayload(e.Data, e.AllowedEffect);
     if (payload == null) return;
     int index;
-    ComputeDropSlot(PointToClient(new Point(e.X, e.Y)), out index);
+    ComputeDropSlot(ToPanel(PointToClient(new Point(e.X, e.Y))), out index);
     bool committed;
     if (payload.ItemId != null)
      committed = app.TryMoveItem(payload.SourceGroup, payload.ItemId, groupId, index);
@@ -1220,7 +1839,7 @@ namespace MacDeskNative {
    }
    menu.Items.Add(new ToolStripSeparator());
    menu.Items.Add("关闭", null, MenuAction(delegate { app.ClosePanel(); }));
-   menu.Show(this, point);
+   menu.Show(this, ToWindow(point));
   }
 
   private void ShowEntryMenu(PanelEntry entry, Point point) {
@@ -1266,7 +1885,7 @@ namespace MacDeskNative {
    menu.Items.Add(new ToolStripSeparator());
    ToolStripItem remove = menu.Items.Add("移除（不删除原文件）", null, MenuAction(delegate { app.DeleteItem(itemGroupId, itemId); }));
    remove.Tag = PanelDrawing.Destructive;
-   menu.Show(this, point);
+   menu.Show(this, ToWindow(point));
   }
 
   // --- Dismissal ------------------------------------------------------------------------
@@ -1303,7 +1922,7 @@ namespace MacDeskNative {
    leftWasDown = left;
    rightWasDown = right;
    if (!pressedEdge) return;
-   if (!Bounds.Contains(Control.MousePosition) && !app.SourceContains(Control.MousePosition)) app.ClosePanel();
+   if (!PanelScreenRect().Contains(Control.MousePosition)) app.ClosePanel();
   }
 
   // --- Keyboard -------------------------------------------------------------------------
@@ -1457,6 +2076,8 @@ namespace MacDeskNative {
     if (sheetCache != null) { sheetCache.Dispose(); sheetCache = null; }
     if (titleCache != null) { titleCache.Dispose(); titleCache = null; }
     blitAttributes.Dispose();
+    transitionAttributes.Dispose();
+    if (tileBody != null) { tileBody.Dispose(); tileBody = null; }
     titleFont.Dispose(); labelFont.Dispose(); subLabelFont.Dispose(); searchFont.Dispose();
     buttonFont.Dispose(); buttonBoldFont.Dispose(); pickerTitleFont.Dispose(); plusFont.Dispose();
    }
@@ -1483,20 +2104,52 @@ namespace MacDeskNative {
  internal static class PanelDrawing {
   internal static readonly object Destructive = new object();
   [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
-  static readonly Font MenuFont = Ui.MakeFont(Ui.Cjk, 13.5f, FontStyle.Regular);
+  static readonly Font MenuFont = Ui.MakeFont(Ui.Cjk, 14f, FontStyle.Regular);
 
   internal static void StyleMenu(ContextMenuStrip menu) {
    if (menu == null) return;
    menu.ShowImageMargin = false;
    menu.ShowCheckMargin = false;
    menu.Font = MenuFont;
-   menu.Padding = new Padding(5, 6, 5, 6);
+   menu.Padding = new Padding(6, 6, 6, 6);
+   menu.DropShadowEnabled = false; // the legacy square shadow showed as boxes at the rounded corners
    menu.BackColor = Color.FromArgb(38, 38, 42);
    menu.ForeColor = Color.White;
    menu.Renderer = new AppleMenuRenderer();
    menu.ItemAdded += delegate(object s, ToolStripItemEventArgs e) { Pad(e.Item); };
    foreach (ToolStripItem item in menu.Items) Pad(item);
    menu.Opened += delegate { Round(menu); };
+   CloseOnOutsideClick(menu);
+  }
+
+  [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+  static bool ButtonDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+  // Our menus open over the desktop / non-activating windows, so the desktop stays the
+  // active window and WinForms' "click elsewhere closes the menu" (which relies on our app
+  // losing activation) never fires. Watch the buttons ourselves while a menu is open and close
+  // it on the first press outside it (or outside any submenu it has open).
+  static void CloseOnOutsideClick(ToolStripDropDown menu) {
+   var poll = new Timer { Interval = 10 };
+   bool leftWas = false, rightWas = false;
+   poll.Tick += delegate {
+    if (menu.IsDisposed || !menu.Visible) { poll.Stop(); return; }
+    bool left = ButtonDown(0x01), right = ButtonDown(0x02);
+    bool pressed = (left && !leftWas) || (right && !rightWas);
+    leftWas = left; rightWas = right;
+    if (pressed && !Contains(menu, Control.MousePosition)) menu.Close(ToolStripDropDownCloseReason.AppClicked);
+   };
+   menu.Opened += delegate { leftWas = ButtonDown(0x01); rightWas = ButtonDown(0x02); poll.Start(); };
+   menu.Closed += delegate { poll.Stop(); };
+   menu.Disposed += delegate { poll.Stop(); poll.Dispose(); };
+  }
+  static bool Contains(ToolStripDropDown dd, Point screen) {
+   if (dd.Visible && dd.Bounds.Contains(screen)) return true;
+   foreach (ToolStripItem item in dd.Items) {
+    var mi = item as ToolStripMenuItem;
+    if (mi != null && mi.HasDropDownItems && mi.DropDown.Visible && Contains(mi.DropDown, screen)) return true;
+   }
+   return false;
   }
   internal static void StyleDropDown(ToolStripMenuItem parent) {
    var dd = parent.DropDown as ToolStripDropDownMenu;
@@ -1504,7 +2157,8 @@ namespace MacDeskNative {
    dd.ShowImageMargin = false;
    dd.ShowCheckMargin = false;
    dd.Font = MenuFont;
-   dd.Padding = new Padding(5, 6, 5, 6);
+   dd.Padding = new Padding(6, 6, 6, 6);
+   dd.DropShadowEnabled = false;
    dd.BackColor = Color.FromArgb(38, 38, 42);
    dd.Renderer = new AppleMenuRenderer();
    foreach (ToolStripItem item in dd.Items) Pad(item);
@@ -1512,11 +2166,18 @@ namespace MacDeskNative {
   }
   static void Pad(ToolStripItem item) {
    if (item is ToolStripSeparator) { item.Margin = new Padding(0, 3, 0, 3); return; }
-   item.Padding = new Padding(8, 5, 18, 5);
+   item.Padding = new Padding(10, 7, 26, 7);
    item.Margin = new Padding(0, 1, 0, 1);
   }
   static void Round(ToolStripDropDown dd) {
-   try { if (dd.IsHandleCreated) { int corner = 2; DwmSetWindowAttribute(dd.Handle, 33, ref corner, 4); } } catch { }
+   // Rounded corners from DWM, with a dark hairline instead of Windows 11's light default
+   // border (DWMWA_BORDER_COLOR, COLORREF = 0x00BBGGRR).
+   try {
+    if (dd.IsHandleCreated) {
+     int corner = 2; DwmSetWindowAttribute(dd.Handle, 33, ref corner, 4);
+     int border = 0x00504A4A; DwmSetWindowAttribute(dd.Handle, 34, ref border, 4);
+    }
+   } catch { }
   }
 
   private sealed class AppleMenuRenderer : ToolStripProfessionalRenderer {
@@ -1531,9 +2192,9 @@ namespace MacDeskNative {
     if (!e.Item.Selected || !e.Item.Enabled) return;
     var g = e.Graphics;
     g.SmoothingMode = SmoothingMode.AntiAlias;
-    var r = new RectangleF(2, 0, e.Item.Width - 4, e.Item.Height);
+    var r = new RectangleF(1, 0, e.Item.Width - 2, e.Item.Height);
     bool destructive = e.Item.Tag == Destructive;
-    using (var path = Ui.Squircle(r, 6))
+    using (var path = Ui.Squircle(r, 7))
     using (var b = new SolidBrush(destructive ? Color.FromArgb(255, 69, 58) : Color.FromArgb(10, 132, 255))) g.FillPath(b, path);
    }
    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
