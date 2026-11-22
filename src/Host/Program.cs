@@ -1,4 +1,5 @@
 using MacDesk.Core;
+using System.Collections.Generic;
 using System;using System.IO;using System.Drawing;using System.Diagnostics;using System.Threading;using System.Windows.Forms;using System.Runtime.InteropServices;using System.Reflection;using System.Security.Cryptography;using System.Text;using System.Web.Script.Serialization;
 [assembly: AssemblyTitle("MacDesk Native Desktop")]
 [assembly: AssemblyDescription("Mac Style Glass Desktop Folders and Widgets for Windows 11")]
@@ -155,13 +156,10 @@ namespace MacDeskNative {
    CoreTests.Run(Path.Combine(root,"core"));
    CheckBackdropSampling();
    CheckCompactCalendar();
-   // Frontend: springs, grid snapping, controller wiring, folder transition.
+   CheckDesktopGrid();
+   // Frontend: springs, controller wiring, folder transition.
    var spring=new Spring(0,0.3,0.8);spring.Target=1;for(int i=0;i<240;i++)spring.Step(1/240.0);var spring60=new Spring(0,0.3,0.8);spring60.Target=1;for(int i=0;i<60;i++)spring60.Step(1/60.0);
    Check(spring.Settled&&spring60.Settled&&Math.Abs(spring.Value-1)<0.001,"interactive springs settle the same at 60 and 240 Hz");
-   Point snapped=DesktopFolderForm.SnapPointToGrid(455,31,440,1920,1080);
-   Check(snapped.X==440&&snapped.Y==24,"magnetic grid snap origin");
-   Point snapped2=DesktopFolderForm.SnapPointToGrid(440+132+18,24+148-12,440,1920,1080);
-   Check(snapped2.X==440+132&&snapped2.Y==24+148,"magnetic grid snap second slot");
    string uiRoot=Path.Combine(root,"ui");Directory.CreateDirectory(uiRoot);
    using(var app=new AppController(uiRoot,false,true)){
     Check(app.Data.groups.Count==4,"controller seeds starter folders before Home");
@@ -173,16 +171,63 @@ namespace MacDeskNative {
     // open panel draws them, and reversing half-way is continuous.
     using(var layer=new FolderLayer(app,app.Data.groups[0].id)){var wa=Screen.PrimaryScreen.WorkingArea;layer.PrepareTransitionForTest(wa,new Rectangle(wa.Left+676,wa.Top+30,Metrics.DesktopIcon,Metrics.DesktopIcon));string problem=layer.CheckTransitionInvariants();Check(problem==null,"folder transition: "+problem);}
     var gridFixture = new DeskGroup { id = "folder-handoff-test", title = "Folder handoff" };
-    for (int i = 0; i < 21; i++) gridFixture.items.Add(EntryServices.FromUrl("https://example.test/" + i));
+    gridFixture.items.Add(EntryServices.FromPath(uiRoot));
+     gridFixture.items[0].title = "nonapp fixture folder";
+    for (int i = 0; i < 21; i++) {
+      if (i % 3 == 1) {
+       var url = EntryServices.FromUrl("https://example.test/" + i);
+       url.title = "nonapp fixture URL " + i;
+       gridFixture.items.Add(url);
+      }
+     else gridFixture.items.Add(new DeskItem {
+      id = DesktopStore.NewId(), title = "App " + i, type = "app", target = Path.Combine(uiRoot, "fixture-" + i + ".exe")
+     });
+    }
+    var preview = new List<DeskItem>(DesktopFolderForm.PreviewApps(gridFixture));
+    Check(preview.Count == 9 && preview[0] == gridFixture.items[1] && preview[1] == gridFixture.items[3] &&
+     preview.TrueForAll(item => item.type == "app"), "desktop preview skips folders and URLs and fills nine app slots");
+     gridFixture.items.Add(new DeskItem {
+      id = DesktopStore.NewId(), type = "file", title = "nonapp fixture file", target = Path.Combine(uiRoot, "fixture.txt")
+     });
     app.Service.AddGroup(gridFixture);
+     app.Service.AddItem(g, EntryServices.FromUrl("https://nonapp.test/"));
     using (var layer = new FolderLayer(app, gridFixture.id)) {
      layer.PrepareTransitionForTest(new Rectangle(0, 0, 960, 480), new Rectangle(32, 30, Metrics.DesktopIcon, Metrics.DesktopIcon));
-     string problem = layer.CheckTransitionHandoffs();
+      string problem = layer.CheckTransitionHandoffs(14, "nonapp");
      Check(problem == null, "folder grid handoff: " + problem);
     }
+     using (var shortcuts = new ToolStripMenuItem()) {
+      app.PopulateOtherShortcuts(shortcuts);
+      Check(shortcuts.DropDownItems.Count == 2, "tray shows only groups with non-app shortcuts");
+      var category = (ToolStripMenuItem)shortcuts.DropDownItems[1];
+      Check(category.Text == gridFixture.title &&
+       category.DropDownItems.Count == 9, "tray groups non-app shortcuts and leaves out apps");
+     }
     app.Quit();
    }
    File.WriteAllText(Path.Combine(root,"PASS.txt"),"Backend (CoreTests) and frontend self-tests passed.");
+  }
+  static void CheckDesktopGrid() {
+   var work = new Rectangle(0, 40, 1920, 1000);
+   var size = new Size(DesktopFolderForm.TileWidth, DesktopFolderForm.TileHeight);
+   for (int x = 0; x <= work.Right - 356; x += 4) {
+    var widgets = new Rectangle(x, 100, 356, 500);
+    var grid = new DesktopGrid(work, widgets);
+    var used = new HashSet<Point>();
+    for (int index = 0; index < 80; index++) {
+     Point cell = grid.Cell(index);
+     Check(used.Add(cell) && cell.X >= work.Left && cell.X + size.Width <= work.Right, "desktop cells have distinct in-bounds columns");
+     Check(!grid.Reserved.IntersectsWith(new Rectangle(cell, size)), "desktop tiles leave the widget clear");
+     Check(grid.SlotAt(cell.X + size.Width / 2, cell.Y + 35) == index, "desktop drop index matches layout");
+    }
+   }
+   var left = new DesktopGrid(work, new Rectangle(0, 100, 356, 500));
+   var right = new DesktopGrid(work, new Rectangle(work.Right - 356, 100, 356, 500));
+   Check(left.Cell(0).X > left.Reserved.Right && right.Cell(0).X == DesktopFolderForm.EdgePad, "desktop moves to the side with room");
+   var narrow = new DesktopGrid(new Rectangle(0, 0, 400, 850), new Rectangle(22, 0, 356, 500));
+   Check(narrow.Viewport.Top >= narrow.Reserved.Bottom && narrow.MaxScroll(40) > 0, "narrow layout uses a separate scrolling band");
+   Point last = narrow.Cell(39);
+   Check(last.Y + size.Height - narrow.MaxScroll(40) <= narrow.Viewport.Bottom, "last desktop slot can be scrolled into view");
   }
   static void CheckCompactCalendar() {
    var months = new[] { new DateTime(2026, 2, 1), new DateTime(2026, 11, 1), new DateTime(2026, 5, 1) };

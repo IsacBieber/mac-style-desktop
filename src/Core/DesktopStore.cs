@@ -42,6 +42,8 @@ namespace MacDesk.Core {
     byte[] b = File.Exists(path) ? File.ReadAllBytes(path) : null;
     DesktopData next = b == null ? new DesktopData() : Serializer().Deserialize<DesktopData>(Encoding.UTF8.GetString(b).TrimStart('\uFEFF'));
     Validate(next);
+    foreach (var group in next.groups)
+     foreach (var item in group.items) EntryServices.NormalizeAppShortcut(item);
     Data = next;
     original = b == null ? null : Hash(b);
    }

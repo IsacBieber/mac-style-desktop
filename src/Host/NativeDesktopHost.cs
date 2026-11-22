@@ -8,8 +8,7 @@ namespace MacDeskNative
 {
     /// <summary>
     /// Selects an EXISTING visible Shell desktop view for creation-time WS_CHILD hosting.
-    /// This is not a global/topmost Z-order workaround for Win+D. No Explorer window,
-    /// icon visibility, owner, band, or hierarchy is modified by this class.
+    /// Hosts MacDesk's windows and manages the native desktop icon view during a session.
     /// </summary>
     public static class NativeDesktopHost
     {
@@ -59,6 +58,9 @@ namespace MacDeskNative
         private static uint shellPid;
         private static IntPtr shellWindow;
         private static IntPtr shellRoot;
+        private static IntPtr hiddenIconList, iconView;
+        private const int WindowStyle = -16, VisibleStyle = 0x10000000;
+        private const int HideWindow = 0, ShowNoActivate = 8;
 
         private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
 
@@ -74,6 +76,10 @@ namespace MacDeskNative
         private static extern bool IsWindow(IntPtr window);
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        private static extern int GetWindowStyle(IntPtr window, int index);
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindowAsync(IntPtr window, int command);
         [DllImport("user32.dll")]
         private static extern bool IsIconic(IntPtr window);
         [DllImport("user32.dll")]
@@ -106,6 +112,37 @@ namespace MacDeskNative
         private static extern bool DestroyWindow(IntPtr window);
         [DllImport("kernel32.dll", ExactSpelling = true)]
         private static extern uint GetCurrentThreadId();
+
+        internal static void HideDesktopIcons(IntPtr widgets, IntPtr folders)
+        {
+            if (hiddenIconList != IntPtr.Zero || !IsHosted(widgets) || !IsHosted(folders))
+                return;
+            IntPtr view = Parent;
+            IntPtr list = FindWindowEx(view, IntPtr.Zero, "SysListView32", null);
+            if (!IsIconList(view, list) || (GetWindowStyle(list, WindowStyle) & VisibleStyle) == 0)
+                return;
+            if (ShowWindowAsync(list, HideWindow))
+            {
+                iconView = view;
+                hiddenIconList = list;
+            }
+        }
+
+        internal static void RestoreDesktopIcons()
+        {
+            IntPtr list = hiddenIconList;
+            hiddenIconList = IntPtr.Zero;
+            if (IsIconList(iconView, list))
+                ShowWindowAsync(list, ShowNoActivate);
+            iconView = IntPtr.Zero;
+        }
+
+        private static bool IsIconList(IntPtr view, IntPtr list)
+        {
+            return view != IntPtr.Zero && list != IntPtr.Zero && IsSameShell(shellWindow, shellPid) &&
+                HasPid(view, shellPid) && HasPid(list, shellPid) && GetParent(list) == view &&
+                ClassName(list) == "SysListView32" && ClassName(view) == "SHELLDLL_DefView";
+        }
 
         public static void EnsureChildTopOrder(IntPtr primaryChild, IntPtr secondaryChild)
         {

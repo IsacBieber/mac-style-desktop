@@ -42,9 +42,51 @@ namespace MacDesk.Core {
    string ext = Path.GetExtension(full);
    string title = Path.GetFileName(full.TrimEnd(Path.DirectorySeparatorChar));
    if (String.IsNullOrEmpty(title)) title = full;
-   else if (ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
+   bool shortcut = ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase);
+   bool executable = ext.Equals(".exe", StringComparison.OrdinalIgnoreCase);
+   if (!folder && (shortcut || executable))
     title = Path.GetFileNameWithoutExtension(title);
-   return new DeskItem { id = DesktopStore.NewId(), title = title, description = "", type = folder ? "folder" : (ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) || ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase) ? "app" : "file"), target = full, icon = "", arguments = "" };
+   string type = folder ? "folder" : (executable || shortcut ? "app" : "file");
+   var item = new DeskItem { id = DesktopStore.NewId(), title = title, description = "", type = type, target = full, icon = "", arguments = "" };
+   NormalizeAppShortcut(item);
+   return item;
+  }
+  // Keep the .lnk as the launch target so Windows still applies its icon, arguments and working directory.
+  internal static void NormalizeAppShortcut(DeskItem item) {
+   if (item.type == "app" && item.target != null && item.target.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) &&
+       !ShortcutLaunchesApp(item.target))
+    item.type = "file";
+  }
+  static bool ShortcutLaunchesApp(string path) {
+   if (!File.Exists(path)) return false;
+   object shell = null, shortcut = null;
+   try {
+    Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+    if (shellType == null) return false;
+    shell = Activator.CreateInstance(shellType);
+    shortcut = ((dynamic)shell).CreateShortcut(path);
+    string target = ((dynamic)shortcut).TargetPath;
+    const string appsFolder = "shell:AppsFolder\\";
+    if (String.IsNullOrEmpty(target)) return false;
+    if (target.StartsWith(appsFolder, StringComparison.OrdinalIgnoreCase)) return true;
+    if (String.Equals(Path.GetFileName(target), "explorer.exe", StringComparison.OrdinalIgnoreCase)) {
+     string args = ((dynamic)shortcut).Arguments;
+     return String.IsNullOrWhiteSpace(args) || args.TrimStart().StartsWith(appsFolder, StringComparison.OrdinalIgnoreCase);
+    }
+    switch (Path.GetExtension(target).ToLowerInvariant()) {
+     case ".exe": case ".com": case ".bat": case ".cmd": case ".msc": case ".cpl": case ".appref-ms":
+      return !Directory.Exists(target);
+     default:
+      return false;
+    }
+   } catch (COMException) {
+    return false;
+   } catch (ArgumentException) {
+    return false;
+   } finally {
+    Release(shortcut);
+    Release(shell);
+   }
   }
   public static DeskItem FromUrl(string url) {
    string full = ValidateTarget("url", url, false);
@@ -159,10 +201,10 @@ namespace MacDesk.Core {
          name.IndexOf("卸载", StringComparison.OrdinalIgnoreCase) >= 0 ||
          name.IndexOf("MacDesk", StringComparison.OrdinalIgnoreCase) >= 0 ||
          name.IndexOf("使用说明", StringComparison.OrdinalIgnoreCase) >= 0) continue;
-     if (!seen.Add(name)) continue;
+     if (seen.Contains(name)) continue;
      try {
       DeskItem item = FromPath(file);
-      output.Add(item);
+      if (item.type == "app" && seen.Add(name)) output.Add(item);
      } catch { }
     }
     if (depth < maxDepth) {

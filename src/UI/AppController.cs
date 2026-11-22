@@ -152,13 +152,20 @@ namespace MacDeskNative {
      Home.Show();
      NativeDesktop.Lower(Home.Handle);
      NativeDesktopHost.EnsureChildTopOrder(Home.Handle, DesktopFolders.Handle);
+     Home.LocationChanged += ReflowDesktopWidgets;
+     Home.SizeChanged += ReflowDesktopWidgets;
+     DesktopFolders.ReflowWidgets();
      CreateTray();
+     NativeDesktopHost.HideDesktopIcons(Home.Handle, DesktopFolders.Handle);
      ThreadPool.QueueUserWorkItem(delegate { try { EntryServices.DiscoverSystemApps(); } catch { } });
     }
    } catch { Quit(); throw; }
   }
 
   protected override void Dispose(bool disposing) { if (disposing) Quit(); base.Dispose(disposing); }
+  void ReflowDesktopWidgets(object sender, EventArgs e) {
+   if (!closing && DesktopFolders != null) DesktopFolders.ReflowWidgets();
+  }
   public void ReportError(Exception ex) { Fail(ex); }
   void Fail(Exception ex) {
    if (testMode) throw ex;
@@ -290,12 +297,9 @@ namespace MacDeskNative {
   }
 
   public void SetHomePosition(int x, int y) {
-   Rectangle work = Screen.FromControl(Home).WorkingArea;
-   int clampedX = Math.Max(0, Math.Min(Math.Max(0, work.Width - Home.Width), x));
-   int clampedY = Math.Max(0, Math.Min(Math.Max(0, work.Height - Home.Height), y));
-   // Keep the live card where it is saved, so it can't be stranded off-screen.
-   if (Home.Location != new Point(clampedX, clampedY)) Home.Location = new Point(clampedX, clampedY);
-   if (Data.homeX != clampedX || Data.homeY != clampedY) Try(delegate { Service.SetHomePosition(clampedX, clampedY); });
+   Point position = Home.ClampLocation(new Point(x, y));
+   if (Home.Location != position) Home.Location = position;
+   if (Data.homeX != position.X || Data.homeY != position.Y) Try(delegate { Service.SetHomePosition(position.X, position.Y); });
   }
 
 
@@ -317,7 +321,7 @@ namespace MacDeskNative {
   }
   public void PickFilesToAdd(string groupId) {
    string[] files = Modal(owner => {
-    using (var f = new OpenFileDialog { Title = "选择要添加到文件夹的文件或程序", Multiselect = true, CheckFileExists = true, DereferenceLinks = false }) {
+     using (var f = new OpenFileDialog { Title = "选择文件。普通文件可在托盘打开", Multiselect = true, CheckFileExists = true, DereferenceLinks = false }) {
      return f.ShowDialog(owner) == DialogResult.OK ? f.FileNames : null;
     }
    });
@@ -325,7 +329,7 @@ namespace MacDeskNative {
   }
   public void PickFolderToAdd(string groupId) {
    string folder = Modal(owner => {
-    using (var f = new FolderBrowserDialog { Description = "选择要添加到文件夹的目录" }) {
+     using (var f = new FolderBrowserDialog { Description = "选择目录，添加到托盘的「其他快捷入口」" }) {
      return f.ShowDialog(owner) == DialogResult.OK ? f.SelectedPath : null;
     }
    });
@@ -384,6 +388,27 @@ namespace MacDeskNative {
   public void RunEntryAction(Action action, bool closeAfter) {
    if (Try(action) && closeAfter) ClosePanel();
   }
+  internal void PopulateOtherShortcuts(ToolStripMenuItem menu) {
+   while (menu.DropDownItems.Count > 0) {
+    ToolStripItem previous = menu.DropDownItems[0];
+    menu.DropDownItems.RemoveAt(0);
+    previous.Dispose();
+   }
+   foreach (DeskGroup group in Data.groups) {
+    ToolStripMenuItem category = null;
+    foreach (DeskItem item in group.items) {
+     if (item.type == "app") continue;
+     if (category == null) category = new ToolStripMenuItem(group.title.Replace("&", "&&"));
+     string groupId = group.id, itemId = item.id;
+     category.DropDownItems.Add(item.title.Replace("&", "&&"), null, delegate { Launch(groupId, itemId); });
+    }
+    if (category != null) {
+     PanelDrawing.StyleDropDown(category);
+     menu.DropDownItems.Add(category);
+    }
+   }
+   menu.Visible = menu.DropDownItems.Count > 0;
+  }
   void CreateTray() {
    Icon appIcon = SystemIcons.Application;
    try {
@@ -400,6 +425,21 @@ namespace MacDeskNative {
     NativeDesktop.Lower(Home.Handle);
    });
    menu.Items.Add("新建文件夹…", null, delegate { AddGroup(); });
+    var shortcuts = new ToolStripMenuItem("其他快捷入口");
+    menu.Items.Add(shortcuts);
+    PanelDrawing.StyleDropDown(shortcuts);
+    DesktopData menuData = null;
+    menu.Opening += delegate {
+     if (menuData == Data) return;
+     PopulateOtherShortcuts(shortcuts);
+     menuData = Data;
+    };
+   menu.Items.Add("在资源管理器打开桌面目录", null, delegate {
+    Try(delegate {
+     string directory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+     EntryServices.Open(new DeskItem { type = "folder", target = directory });
+    });
+   });
    menu.Items.Add("重新读取配置", null, delegate { try { Service.Reload(); Wallpaper.Refresh(true); } catch (Exception ex) { Fail(ex); } });
    menu.Items.Add("打开备份目录", null, delegate {
     try {
@@ -416,14 +456,18 @@ namespace MacDeskNative {
   public void Quit() {
    if (closing) return;
    closing = true;
-   HideDim();
-   DiscardPrefetch();
-   if (Panel != null) Panel.Dispose();
-   if (tray != null) { tray.Visible = false; tray.Dispose(); }
-   if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.Dispose();
-   if (Home != null && !Home.IsDisposed) Home.Dispose();
-   if (dialogOwner != null && !dialogOwner.IsDisposed) dialogOwner.Dispose();
-   ExitThread();
+   try {
+    HideDim();
+    DiscardPrefetch();
+    if (Panel != null) Panel.Dispose();
+    if (tray != null) { tray.Visible = false; tray.Dispose(); }
+    if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.Dispose();
+    if (Home != null && !Home.IsDisposed) Home.Dispose();
+    if (dialogOwner != null && !dialogOwner.IsDisposed) dialogOwner.Dispose();
+   } finally {
+    if (!testMode) NativeDesktopHost.RestoreDesktopIcons();
+    ExitThread();
+   }
   }
  }
 }

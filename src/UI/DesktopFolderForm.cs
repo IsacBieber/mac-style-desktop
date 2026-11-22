@@ -14,7 +14,7 @@ namespace MacDeskNative {
  // iOS home-screen folders: frosted wallpaper squircles with a 3x3 app preview, spring
  // physics for hover / press / drop, rendered at display refresh with dirty rectangles.
  public class DesktopFolderForm : Form {
-  public const int TileWidth = 112, TileHeight = 130, StepX = 132, StepY = 148, LeftReserve = 440, EdgePad = 24;
+  public const int TileWidth = 112, TileHeight = 130, StepX = 132, StepY = 148, EdgePad = 24;
   public const int IconSize = Metrics.DesktopIcon;
   public const float IconRadius = Metrics.DesktopIconRadius;
   const int IconTop = 6;
@@ -32,7 +32,9 @@ namespace MacDeskNative {
   Point down, grabOffset, mouseClient = new Point(-999, -999);
   Rectangle magneticPreview = Rectangle.Empty, ghostDrawn = Rectangle.Empty;
   bool dragging, rendering, desktopChildMode, fullRedraw = true;
-  int scroll, contentHeight;
+  int scroll;
+  DesktopGrid grid;
+  Rectangle layoutDirty;
 
   public bool DesktopChildMode { get { return desktopChildMode; } }
 
@@ -133,18 +135,37 @@ namespace MacDeskNative {
   }
 
 
-  public static Point SnapPointToGrid(int x, int y, int leftOrigin, int clientWidth, int clientHeight) {
-   int left = Math.Min(leftOrigin, Math.Max(8, clientWidth - TileWidth - EdgePad));
-   int col = Math.Max(0, (int)Math.Round((double)(x - left) / StepX));
-   int row = Math.Max(0, (int)Math.Round((double)(y - EdgePad) / StepY));
-   int snappedX = Math.Max(left, Math.Min(Math.Max(left, clientWidth - TileWidth - EdgePad), left + col * StepX));
-   int snappedY = Math.Max(EdgePad, Math.Min(Math.Max(EdgePad, clientHeight - TileHeight - EdgePad), EdgePad + row * StepY));
-   return new Point(snappedX, snappedY);
+  DesktopGrid CurrentGrid() {
+   Rectangle work = Screen.PrimaryScreen.WorkingArea;
+   HomeForm home = app.Home;
+   Rectangle widgets = home == null || home.IsDisposed ? Rectangle.Empty : home.Bounds;
+   if (IsHandleCreated) {
+    work = RectangleToClient(work);
+    if (home != null && home.IsHandleCreated) widgets = RectangleToClient(home.RectangleToScreen(home.ClientRectangle));
+   } else work.Offset(-Screen.PrimaryScreen.Bounds.Left, -Screen.PrimaryScreen.Bounds.Top);
+   return new DesktopGrid(Rectangle.Intersect(ClientRectangle, work), widgets);
   }
 
-  int DynamicLeftOrigin() {
-   int reserve = app != null && app.Home != null && !app.Home.IsDisposed ? Math.Max(280, app.Home.Right + 28) : LeftReserve;
-   return Math.Min(reserve, Math.Max(8, ClientSize.Width - TileWidth - EdgePad));
+  internal void ReflowWidgets() {
+   if (Disposing || IsDisposed || !IsHandleCreated) return;
+   DesktopGrid next = CurrentGrid(), old = grid;
+   grid = next;
+   if (!next.SameSlots(old)) {
+    int newScroll = Math.Min(scroll, grid.MaxScroll(tiles.Count));
+    fullRedraw |= old == null || next.Viewport != old.Viewport || scroll != newScroll;
+    scroll = newScroll;
+    foreach (var tile in tiles) {
+     tile.Bounds = new Rectangle(CellPos(tile.Index), tile.Bounds.Size);
+     Place(tile, tile.Bounds);
+    }
+    WakeAnim();
+   }
+   if (old != null && old.Reserved != next.Reserved) {
+    Rectangle changed = Union(old.Reserved, next.Reserved);
+    foreach (var tile in tiles)
+     if (tile.Drawn.IntersectsWith(changed)) layoutDirty = Union(layoutDirty, Rectangle.Intersect(tile.Drawn, changed));
+    if (!layoutDirty.IsEmpty) WakeAnim();
+   }
   }
 
   public void RefreshData() {
@@ -156,14 +177,13 @@ namespace MacDeskNative {
    WakeAnim();
   }
 
-  // Phone-style layout: folders have no free coordinates, only an order. Cell i of a fixed
-  // grid (StepX x StepY, starting right of the widgets) holds folder i; "New" comes last.
+  // Folders have one order. The desktop grid maps it into the space around the widgets.
   void LayoutTiles() {
+   grid = CurrentGrid();
    var previous = new Dictionary<string, FolderTile>();
    foreach (var t in tiles) previous[t.Plus ? "+" : t.Id] = t;
    tiles.Clear();
    int index = 0;
-   contentHeight = 0;
    var liveFaces = new HashSet<string>();
    foreach (var group in app.Data.groups) {
     var bounds = new Rectangle(CellPos(index), new Size(TileWidth, TileHeight));
@@ -174,7 +194,6 @@ namespace MacDeskNative {
     liveFaces.Add(tile.FaceKey);
     Place(tile, bounds);
     tiles.Add(tile);
-    contentHeight = Math.Max(contentHeight, bounds.Bottom + EdgePad);
    }
    var add = new Rectangle(CellPos(index), new Size(TileWidth, TileHeight));
    FolderTile plus;
@@ -182,8 +201,7 @@ namespace MacDeskNative {
    plus.Id = null; plus.Title = "新建"; plus.Plus = true; plus.Group = null; plus.Bounds = add; plus.Index = index;
    Place(plus, add);
    tiles.Add(plus);
-   contentHeight = Math.Max(contentHeight, add.Bottom + EdgePad);
-   scroll = Math.Max(0, Math.Min(scroll, Math.Max(0, contentHeight - ClientSize.Height)));
+   scroll = Math.Min(scroll, grid.MaxScroll(tiles.Count));
    if (hover != null && !tiles.Contains(hover)) hover = null;
    dropTarget = null;
    // Drop cached 3x3 previews of folders whose contents changed.
@@ -197,8 +215,19 @@ namespace MacDeskNative {
 
   static string FaceKey(DeskGroup g) {
    var sb = new System.Text.StringBuilder(g.id);
-   for (int i = 0; i < Math.Min(9, g.items.Count); i++) sb.Append('|').Append(g.items[i].id).Append(g.items[i].target).Append(g.items[i].icon);
+   foreach (DeskItem item in PreviewApps(g))
+    sb.Append('|').Append(item.id).Append(item.target).Append(item.icon);
    return sb.ToString();
+  }
+
+  internal static IEnumerable<DeskItem> PreviewApps(DeskGroup group) {
+   if (group == null) yield break;
+   int count = 0;
+   foreach (DeskItem item in group.items) {
+    if (item.type != "app") continue;
+    yield return item;
+    if (++count == 9) yield break;
+   }
   }
 
   // --- Animation ------------------------------------------------------------------------
@@ -327,6 +356,7 @@ namespace MacDeskNative {
   }
 
   FolderTile Hit(Point point) {
+   if (grid == null || !grid.Viewport.Contains(point) || grid.Reserved.Contains(point)) return null;
    for (int i = tiles.Count - 1; i >= 0; i--) {
     var t = tiles[i];
     if (!Hittable(t)) continue;
@@ -375,13 +405,13 @@ namespace MacDeskNative {
   }
 
   internal static void DrawMiniGrid(Graphics g, DeskGroup grp, Rectangle box, ImageAttributes attributes, ColorMatrix matrix) {
-   if (grp == null) return;
-   int count = Math.Min(9, grp.items.Count);
-   for (int i = 0; i < count; i++) {
+   int slot = 0;
+   foreach (DeskItem item in PreviewApps(grp)) {
+    Rectangle cell = Metrics.IconPixels(Metrics.MiniSlot(slot++, box));
     try {
-     Image image = FolderLayer.CachedIcon(grp.items[i]); // the same bitmap the open folder flies
+     Image image = FolderLayer.CachedIcon(item); // the same bitmap the open folder flies
      if (image == null) continue;
-     Ui.DrawIcon(g, image, Metrics.IconPixels(Metrics.MiniSlot(i, box)), 1f, attributes, matrix);
+     Ui.DrawIcon(g, image, cell, 1f, attributes, matrix);
     } catch (Exception) { }
    }
   }
@@ -547,12 +577,12 @@ namespace MacDeskNative {
   }
 
   void Render() {
-   if (IsDisposed || Disposing || rendering || !IsHandleCreated || ClientSize.Width < 1 || ClientSize.Height < 1) return;
+   if (IsDisposed || Disposing || rendering || grid == null || !IsHandleCreated || ClientSize.Width < 1 || ClientSize.Height < 1) return;
    rendering = true;
    try {
     var g = surface.Begin(ClientSize);
     bool full = fullRedraw || surface.Size != ClientSize;
-    Rectangle dirty = Rectangle.Empty;
+    Rectangle dirty = layoutDirty;
     var current = new Dictionary<FolderTile, Rectangle>();
     foreach (var tile in tiles) {
      Rectangle now = PaintBounds(tile);
@@ -569,6 +599,8 @@ namespace MacDeskNative {
 
     g.SetClip(dirty);
     surface.Clear(dirty);
+    g.SetClip(grid.Viewport, CombineMode.Intersect);
+    if (!grid.Reserved.IsEmpty) g.ExcludeClip(grid.Reserved);
 
     if (ghostAlpha.Value > 0.01 && !magneticPreview.IsEmpty) {
      var slot = magneticPreview; slot.Offset(0, -scroll);
@@ -587,14 +619,16 @@ namespace MacDeskNative {
     }
     if (top != null) DrawTile(g, top);
 
-    if (contentHeight > ClientSize.Height) {
-     var marker = new RectangleF(ClientSize.Width - 46, ClientSize.Height - 40, 30, 30);
+    if (grid.MaxScroll(tiles.Count) > 0) {
+     Rectangle viewport = grid.Viewport;
+     var marker = new RectangleF(viewport.Right - 46, viewport.Bottom - 40, 30, 30);
      using (var b = new SolidBrush(Color.FromArgb(120, 0, 0, 0))) g.FillEllipse(b, marker);
      using (var f = Ui.Centered(false)) using (var b = new SolidBrush(Color.White)) g.DrawString("↕", caption, b, marker, f);
     }
     g.ResetClip();
     surface.Present(Handle, desktopChildMode ? (Point?)null : Location, 255, full ? (Rectangle?)null : dirty);
     fullRedraw = false;
+    layoutDirty = Rectangle.Empty;
    } finally { rendering = false; }
   }
 
@@ -693,9 +727,7 @@ namespace MacDeskNative {
 
   int dragFromIndex = -1, dragToIndex = -1;
 
-  int GridLeft() { return Math.Min(DynamicLeftOrigin(), Math.Max(8, ClientSize.Width - TileWidth - EdgePad)); }
-  int GridColumns() { return Math.Max(1, (ClientSize.Width - GridLeft() - EdgePad + StepX - TileWidth) / StepX); }
-  Point CellPos(int cell) { int cols = GridColumns(); return new Point(GridLeft() + (cell % cols) * StepX, EdgePad + (cell / cols) * StepY); }
+  Point CellPos(int cell) { return grid.Cell(cell); }
   int FolderCount() { int n = 0; foreach (var t in tiles) if (!t.Plus) n++; return n; }
 
   void BeginFolderDrag(FolderTile tile) {
@@ -714,11 +746,8 @@ namespace MacDeskNative {
    tile.X.Snap(rawX); tile.Y.Snap(rawY);
    // Hysteresis: the carried icon's centre must be well inside a cell to claim it.
    float cx = rawX + TileWidth / 2f, cy = rawY + IconTop + IconSize / 2f;
-   int cols = GridColumns(), left = GridLeft(), count = FolderCount();
-   int col = (int)Math.Floor((cx - left + (StepX - TileWidth) / 2f) / StepX);
-   int row = (int)Math.Floor((cy - EdgePad + (StepY - TileHeight) / 2f) / StepY);
-   if (col >= 0 && col < cols && row >= 0 && count > 0) {
-    int cell = row * cols + col;
+   int cell = grid.SlotAt(cx, cy), count = FolderCount();
+   if (cell >= 0 && count > 0 && !grid.Reserved.Contains(Point.Round(new PointF(cx, cy - scroll)))) {
     Point at = CellPos(cell);
     var inner = new RectangleF(at.X + 18, at.Y + IconTop + 10, TileWidth - 36, IconSize - 20);
     if (cell >= count) SetDropIndex(count - 1);       // past the last folder: goes last
@@ -783,7 +812,7 @@ namespace MacDeskNative {
 
   protected override void OnMouseWheel(MouseEventArgs e) {
    base.OnMouseWheel(e);
-   int next = Math.Max(0, Math.Min(Math.Max(0, contentHeight - Height), scroll - (e.Delta / 120) * StepY));
+   int next = Math.Max(0, Math.Min(grid.MaxScroll(tiles.Count), scroll - (e.Delta / 120) * StepY));
    if (next == scroll) return;
    scroll = next;
    fullRedraw = true;

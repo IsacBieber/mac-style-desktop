@@ -407,10 +407,17 @@ namespace MacDeskNative {
   }
 
   void FitCalendarOnScreen() {
-   Rectangle work = Screen.FromControl(this).WorkingArea;
-   int top = PointToScreen(Point.Empty).Y;
-   int limit = Math.Max(work.Top, work.Bottom - Height);
-   if (top > limit) Top -= top - limit;
+   Point position = ClampLocation(Location);
+   if (position != Location) Location = position;
+  }
+
+  internal Point ClampLocation(Point location) {
+   Rectangle work = Screen.PrimaryScreen.WorkingArea;
+   Point screen = PointToScreen(Point.Empty);
+   int offsetX = screen.X - Left, offsetY = screen.Y - Top;
+   int left = Math.Max(0, work.Left - offsetX), top = Math.Max(0, work.Top - offsetY);
+   int right = Math.Max(left, work.Right - offsetX - Width), bottom = Math.Max(top, work.Bottom - offsetY - Height);
+   return new Point(Math.Max(left, Math.Min(right, location.X)), Math.Max(top, Math.Min(bottom, location.Y)));
   }
 
   internal static int HitCalendarDay(Point pt, DateTime month) {
@@ -575,7 +582,8 @@ namespace MacDeskNative {
 
   void ApplyDragTarget() {
    // DWM can move the existing layered bitmap without asking us to paint it again.
-   if (Location != dragTargetLocation) Location = dragTargetLocation;
+   Point target = ClampLocation(dragTargetLocation);
+   if (Location != target) Location = target;
   }
 
   void FinishDrag(Point? releaseScreen) {

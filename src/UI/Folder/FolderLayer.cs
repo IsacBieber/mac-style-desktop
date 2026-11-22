@@ -24,6 +24,7 @@ namespace MacDeskNative {
 
   private readonly AppController app;
   private string groupId;
+  private int groupAppCount;
   private readonly List<PanelEntry> filtered = new List<PanelEntry>();
   private readonly List<TileView> tiles = new List<TileView>();
   private readonly HashSet<ContextMenuStrip> activeMenus = new HashSet<ContextMenuStrip>();
@@ -318,8 +319,9 @@ namespace MacDeskNative {
    transitionGrid.Clear();
    transitionGridClip = GridClip();
    transitionGridClip.Offset(origin);
-   int previewCount = group != null && !tileRect.IsEmpty ? Math.Min(9, group.items.Count) : 0;
-   var shared = new bool[previewCount];
+   var preview = new List<DeskItem>();
+   if (!tileRect.IsEmpty) preview.AddRange(DesktopFolderForm.PreviewApps(group));
+   var shared = new bool[preview.Count];
    foreach (var tile in tiles) {
     float x = tile.X.F, y = tile.Y.F - scroll.F;
     Rectangle icon = FolderLayout.IconInCell(x, y, tile.Scale.F);
@@ -327,7 +329,7 @@ namespace MacDeskNative {
     var label = new Rectangle(origin.X + (int)Math.Round(x - 6), origin.Y + (int)Math.Round(y + Metrics.IconTop + IconPx + Metrics.LabelGap), CellW + 12, 36);
     if (!transitionGridClip.IntersectsWith(icon) && !transitionGridClip.IntersectsWith(label)) continue;
     PanelEntry entry = tile.Entry;
-    int slot = !pickerMode && entry != null && !entry.IsCrossGroup && entry.Index < previewCount ? entry.Index : -1;
+    int slot = !pickerMode && entry != null && !entry.IsCrossGroup ? preview.IndexOf(entry.Item) : -1;
     if (slot >= 0) shared[slot] = true;
     transitionGrid.Add(new TransitionItem {
      Plus = tile.IsPlus, Item = entry == null ? null : entry.Item, PreviewSlot = slot,
@@ -336,8 +338,8 @@ namespace MacDeskNative {
     });
    }
    // A filtered or scrolled panel may not show every item in the desktop preview.
-   for (int i = 0; i < previewCount; i++)
-    if (!shared[i]) transitionGrid.Add(new TransitionItem { Item = group.items[i], PreviewSlot = i });
+   for (int i = 0; i < preview.Count; i++)
+    if (!shared[i]) transitionGrid.Add(new TransitionItem { Item = preview[i], PreviewSlot = i });
    span = -1;
   }
 
@@ -519,7 +521,9 @@ namespace MacDeskNative {
   }
 
   // Compare the last animated pixels to the real grid painters, including clipped rows.
-  internal string CheckTransitionHandoffs() {
+  internal string CheckTransitionHandoffs(int expectedAppCount, string nonAppQuery) {
+   if (filtered.Count != expectedAppCount || filtered.Exists(entry => entry.Item.type != "app"))
+    return "folder grid includes non-app entries or drops apps";
    string problem = CompareTransitionHandoffs();
    if (problem != null) return problem;
    int scrollLimit = Math.Max(0, (int)(contentHeight - GridViewport().Height));
@@ -528,10 +532,14 @@ namespace MacDeskNative {
    CaptureTransitionGrid();
    problem = CompareTransitionHandoffs();
    if (problem != null) return "after scrolling: " + problem;
-   searchQuery = group.items[2].target;
    searchReveal.Snap(1);
    scroll.Snap(0);
+   searchQuery = nonAppQuery;
    RefreshData();
+   if (filtered.Count != 0) return "search shows non-app entries";
+   searchQuery = group.items.Find(item => item.type == "app").target;
+   RefreshData();
+   if (filtered.Count != 1 || filtered[0].Item.type != "app") return "search does not show the matching app";
    LayoutContent(true);
    CaptureTransitionGrid();
    return CompareTransitionHandoffs();
@@ -627,7 +635,7 @@ namespace MacDeskNative {
   private string TitleText() { return pickerMode ? "添加到「" + (group != null ? group.title : "") + "」" : (group != null ? group.title ?? "文件夹" : "文件夹"); }
 
   private Size ComputePanelSize() {
-   return FolderLayout.PanelSize(work.Size, pickerMode, group != null ? group.items.Count : filtered.Count, filtered.Count);
+   return FolderLayout.PanelSize(work.Size, pickerMode, groupAppCount, filtered.Count);
   }
 
   // --- Data -----------------------------------------------------------------------------
@@ -639,7 +647,11 @@ namespace MacDeskNative {
 
    filtered.Clear();
    groupTargets.Clear();
-   if (group != null) foreach (DeskItem it in group.items) if (it.target != null) groupTargets.Add(it.target);
+   groupAppCount = 0;
+   if (group != null) foreach (DeskItem item in group.items) {
+    if (item.target != null) groupTargets.Add(item.target);
+    if (item.type == "app") groupAppCount++;
+   }
    string query = (searchQuery ?? "").Trim();
    if (group != null) {
     if (pickerMode) {
@@ -652,6 +664,7 @@ namespace MacDeskNative {
     } else {
      for (int i = 0; i < group.items.Count; i++) {
       DeskItem item = group.items[i];
+       if (item.type != "app") continue;
       if (query.Length == 0 || Contains(item.title, query) || Contains(item.description, query) || Contains(item.target, query))
        filtered.Add(new PanelEntry(item, i, group.id, group.title, false));
      }
@@ -660,6 +673,7 @@ namespace MacDeskNative {
        if (other.id == groupId) continue;
        for (int i = 0; i < other.items.Count; i++) {
         DeskItem item = other.items[i];
+         if (item.type != "app") continue;
         if (Contains(item.title, query) || Contains(item.description, query) || Contains(item.target, query))
          filtered.Add(new PanelEntry(item, i, other.id, other.title, true));
        }
@@ -846,7 +860,7 @@ namespace MacDeskNative {
     }));
     EndLiveDrag(b);
     for (int i = 0; i < 90; i++) { Tick(dt); if (frameDir != null && i % 15 == 0) surface.SaveSnapshot(System.IO.Path.Combine(frameDir, "drop_" + i.ToString("000") + ".png")); }
-    int now = group.items.FindIndex(v => v.id == firstId);
+    int now = filtered.FindIndex(entry => entry.Item.id == firstId);
     var result = new Bench.Stat("panel reorder: #1 -> slot 6 " + (now == 5 ? "OK" : "WRONG(" + now + ")"));
     result.Add(0);
     stats.Add(result);
@@ -946,7 +960,11 @@ namespace MacDeskNative {
   // Renders every icon/label this folder (and optionally the app picker) will need, so the
   // first scroll or open never pays for icon extraction or text layout mid-animation.
   internal void WarmCaches(bool includePicker) {
-   if (group != null) foreach (DeskItem item in group.items) { CachedIcon(item); CachedLabel(item.title, null, 1f); }
+   if (group != null) foreach (DeskItem item in group.items) {
+    if (item.type != "app") continue;
+    CachedIcon(item);
+    CachedLabel(item.title, null, 1f);
+   }
    CachedLabel("添加", null, 0.85f);
    if (includePicker) foreach (DeskItem item in EntryServices.DiscoverSystemApps()) { CachedIcon(item); CachedLabel(item.title, null, 1f); }
   }
@@ -1092,8 +1110,8 @@ namespace MacDeskNative {
   private void DrawPickerHeader(Graphics g) {
    Rectangle done = PickerDoneBounds(), file = PickerFileBounds(), folder = PickerFolderBounds();
    DrawTextButton(g, done, "完成", buttonBoldFont, Ui.Blue, done.Contains(mouseClient));
-   DrawTextButton(g, file, "文件…", buttonBoldFont, Ui.Blue, file.Contains(mouseClient));
-   DrawTextButton(g, folder, "文件夹…", buttonBoldFont, Ui.Blue, folder.Contains(mouseClient));
+   DrawTextButton(g, file, "链接文件", buttonBoldFont, Ui.Blue, file.Contains(mouseClient));
+   DrawTextButton(g, folder, "链接文件夹", buttonBoldFont, Ui.Blue, folder.Contains(mouseClient));
    var mid = new RectangleF(done.Right, done.Y, file.Left - done.Right, done.Height);
    using (var f = Ui.Centered(true)) using (var b = new SolidBrush(Ui.Label)) g.DrawString("选择应用", pickerTitleFont, b, mid, f);
   }
@@ -1829,8 +1847,8 @@ namespace MacDeskNative {
    ContextMenuStrip menu = NewMenu();
    if (pickerMode) {
     menu.Items.Add("完成", null, MenuAction(delegate { ExitPickerMode(); }));
-    menu.Items.Add("选择文件添加…", null, MenuAction(delegate { app.PickFilesToAdd(groupId); }));
-    menu.Items.Add("选择文件夹添加…", null, MenuAction(delegate { app.PickFolderToAdd(groupId); }));
+    menu.Items.Add("添加文件到托盘…", null, MenuAction(delegate { app.PickFilesToAdd(groupId); }));
+    menu.Items.Add("添加目录到托盘…", null, MenuAction(delegate { app.PickFolderToAdd(groupId); }));
    } else {
     menu.Items.Add("添加应用…", null, MenuAction(delegate { EnterPickerMode(); }));
     menu.Items.Add("手动添加入口 / 网址…", null, MenuAction(delegate { if (group != null) app.AddItem(groupId); }));
@@ -1876,10 +1894,12 @@ namespace MacDeskNative {
     move.Enabled = move.DropDownItems.Count > 0;
     PanelDrawing.StyleDropDown(move);
     menu.Items.Add(move);
-    ToolStripItem up = menu.Items.Add("前移", null, MenuAction(delegate { app.MoveItem(groupId, itemId, groupId, index - 1); }));
-    up.Enabled = index > 0;
-    ToolStripItem down = menu.Items.Add("后移", null, MenuAction(delegate { app.MoveItem(groupId, itemId, groupId, index + 2); }));
-    down.Enabled = group != null && index < group.items.Count - 1;
+    int previous = index > 0 ? group.items.FindLastIndex(index - 1, candidate => candidate.type == "app") : -1;
+    int next = group.items.FindIndex(index + 1, candidate => candidate.type == "app");
+    ToolStripItem up = menu.Items.Add("前移", null, MenuAction(delegate { app.MoveItem(groupId, itemId, groupId, previous); }));
+    up.Enabled = previous >= 0;
+    ToolStripItem down = menu.Items.Add("后移", null, MenuAction(delegate { app.MoveItem(groupId, itemId, groupId, next + 1); }));
+    down.Enabled = next >= 0;
    }
 
    menu.Items.Add(new ToolStripSeparator());

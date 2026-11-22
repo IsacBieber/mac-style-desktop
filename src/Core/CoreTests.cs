@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 
 namespace MacDesk.Core {
  // Backend self-tests (run by `MacDesk.exe --self-test`). Exercise DeskService against a
@@ -98,6 +99,41 @@ namespace MacDesk.Core {
    var seeded = new DeskService(seedRoot);
    Check(seeded.SeedStarterGroupsIfNew() && seeded.Data.groups.Count == 4 && File.Exists(Path.Combine(seedRoot, "desktop.json")), "seed starter folders");
    Check(!seeded.SeedStarterGroupsIfNew(), "seed only once");
+   CheckShortcutTypes(Path.Combine(root, "shortcut-types"));
+  }
+
+  static void CheckShortcutTypes(string root) {
+   Directory.CreateDirectory(root);
+   string directory = Directory.CreateDirectory(Path.Combine(root, "target folder")).FullName;
+   string document = Path.Combine(root, "document.txt");
+   File.WriteAllText(document, "test");
+   string[] targets = { directory, document, Path.Combine(Environment.SystemDirectory, "cmd.exe") };
+   string[] types = { "file", "file", "app" };
+   var group = new DeskGroup { id = "legacy", title = "Legacy shortcuts" };
+   object shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+   try {
+    for (int i = 0; i < targets.Length; i++) {
+     string path = Path.Combine(root, i + ".lnk");
+     object shortcut = ((dynamic)shell).CreateShortcut(path);
+     try {
+      ((dynamic)shortcut).TargetPath = targets[i];
+      ((dynamic)shortcut).Save();
+     } finally {
+      Marshal.ReleaseComObject(shortcut);
+     }
+     DeskItem item = EntryServices.FromPath(path);
+     Check(item.type == types[i] && item.target == path, "shortcut classification preserves its launch target");
+     item.type = "app"; // Older imports marked every .lnk as an app.
+     group.items.Add(item);
+    }
+   } finally {
+    Marshal.ReleaseComObject(shell);
+   }
+   var store = new DesktopStore(root);
+   store.Edit(data => data.groups.Add(group));
+   store.Reload();
+   for (int i = 0; i < targets.Length; i++)
+    Check(store.Data.groups[0].items[i].type == types[i], "legacy shortcut classification on load");
   }
  }
 }

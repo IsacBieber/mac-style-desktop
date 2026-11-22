@@ -211,7 +211,9 @@ namespace MacDesk.Core {
   /// Adds a fully-formed item (e.g. from the edit dialog) at the end.
   public void AddItem(string groupId, DeskItem item) {
    if (item == null) throw new ArgumentNullException("item");
-   Edit(d => FindGroup(d, groupId).items.Add(item));
+   var entry = item.CopyForEdit();
+   EntryServices.NormalizeAppShortcut(entry);
+   Edit(d => FindGroup(d, groupId).items.Add(entry));
   }
 
   /// Optimistic replace: fails if the stored item differs from `expected` (what the caller edited).
@@ -222,7 +224,9 @@ namespace MacDesk.Core {
     int i = items.FindIndex(v => v.id == itemId);
     if (i < 0) throw new InvalidDataException("条目已删除。");
     if (Snapshot(items[i]) != baseline) throw new InvalidDataException("此入口已被其他操作修改，请重新编辑。");
-    items[i] = edited;
+    var entry = edited.CopyForEdit();
+    EntryServices.NormalizeAppShortcut(entry);
+    items[i] = entry;
    });
   }
   static string Snapshot(DeskItem item) { return new JavaScriptSerializer().Serialize(new[] { item.id, item.title, item.description, item.type, item.target, item.icon, item.arguments }); }
