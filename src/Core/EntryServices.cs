@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -36,6 +37,12 @@ namespace MacDesk.Core {
    return parts.Length >= 2 && !String.IsNullOrWhiteSpace(parts[0]) && !String.IsNullOrWhiteSpace(parts[1]) && parts[0] != "?" && parts[0] != "." && parts[1] != "." && parts[1] != "..";
   }
   public static DeskItem FromPath(string path) {
+   object shell = null;
+   try { return FromPath(path, ref shell); }
+   finally { Release(shell); }
+  }
+
+  static DeskItem FromPath(string path, ref object shell) {
    string full = ValidateTarget("file", path, false);
    bool folder = Directory.Exists(full);
    if (!folder && !File.Exists(full)) throw new FileNotFoundException("文件或文件夹不存在。", full);
@@ -48,22 +55,30 @@ namespace MacDesk.Core {
     title = Path.GetFileNameWithoutExtension(title);
    string type = folder ? "folder" : (executable || shortcut ? "app" : "file");
    var item = new DeskItem { id = DesktopStore.NewId(), title = title, description = "", type = type, target = full, icon = "", arguments = "" };
-   NormalizeAppShortcut(item);
+   NormalizeAppShortcut(item, ref shell);
    return item;
   }
   // Keep the .lnk as the launch target so Windows still applies its icon, arguments and working directory.
   internal static void NormalizeAppShortcut(DeskItem item) {
+   object shell = null;
+   try { NormalizeAppShortcut(item, ref shell); }
+   finally { Release(shell); }
+  }
+
+  static void NormalizeAppShortcut(DeskItem item, ref object shell) {
    if (item.type == "app" && item.target != null && item.target.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) &&
-       !ShortcutLaunchesApp(item.target))
+       !ShortcutLaunchesApp(item.target, ref shell))
     item.type = "file";
   }
-  static bool ShortcutLaunchesApp(string path) {
+  static bool ShortcutLaunchesApp(string path, ref object shell) {
    if (!File.Exists(path)) return false;
-   object shell = null, shortcut = null;
+   object shortcut = null;
    try {
-    Type shellType = Type.GetTypeFromProgID("WScript.Shell");
-    if (shellType == null) return false;
-    shell = Activator.CreateInstance(shellType);
+    if (shell == null) {
+     Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+     if (shellType == null) return false;
+     shell = Activator.CreateInstance(shellType);
+    }
     shortcut = ((dynamic)shell).CreateShortcut(path);
     string target = ((dynamic)shortcut).TargetPath;
     const string appsFolder = "shell:AppsFolder\\";
@@ -85,7 +100,6 @@ namespace MacDesk.Core {
     return false;
    } finally {
     Release(shortcut);
-    Release(shell);
    }
   }
   public static DeskItem FromUrl(string url) {
@@ -98,6 +112,19 @@ namespace MacDesk.Core {
    string target = ValidateTarget(item.type, item.target, true);
    ShellExec(target, item.type == "app" ? (item.arguments ?? "") : "", item.type == "url" ? "" : Path.GetDirectoryName(target));
   }
+
+  // The installed desktop host already runs in the interactive user session.
+  // Let the local shell resolve .lnk files, including their stored launch settings.
+  internal static void OpenDesktopApp(DeskItem item) {
+   string target = ValidateTarget("app", item.target, true);
+   using (Process.Start(new ProcessStartInfo {
+    FileName = target,
+    Arguments = item.arguments ?? "",
+    WorkingDirectory = Path.GetDirectoryName(target),
+    UseShellExecute = true
+   })) { }
+  }
+
   static void ShellExec(string target, string arguments, string workingDirectory) {
    object shell = null, windows = null, desktop = null, document = null, application = null;
    try {
@@ -168,6 +195,15 @@ namespace MacDesk.Core {
     if (cachedCandidates != null && (DateTime.UtcNow - candidatesTime).TotalSeconds < 45)
      return new List<DeskItem>(cachedCandidates);
    }
+   var result = ScanSystemApps(60);
+   lock (gate) {
+    cachedCandidates = result;
+    candidatesTime = DateTime.UtcNow;
+    return new List<DeskItem>(result);
+   }
+  }
+
+  internal static List<DeskItem> ScanSystemApps(int limit) {
    var result = new List<DeskItem>();
    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
    var roots = new List<string>();
@@ -177,22 +213,20 @@ namespace MacDesk.Core {
    try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.Programs)); } catch { }
    try { roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms)); } catch { }
 
-   foreach (string dir in roots) {
-    if (String.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
-    int maxDepth = dir.IndexOf("Start Menu", StringComparison.OrdinalIgnoreCase) >= 0 ? 2 : 1;
-    ScanShortcuts(dir, 0, maxDepth, seen, result);
-   }
-   lock (gate) {
-    cachedCandidates = result;
-    candidatesTime = DateTime.UtcNow;
-    return new List<DeskItem>(result);
-   }
-  }
-  static void ScanShortcuts(string dir, int depth, int maxDepth, HashSet<string> seen, List<DeskItem> output) {
-   if (output.Count >= 60) return;
+   object shell = null;
    try {
-    foreach (string file in Directory.GetFiles(dir)) {
-     if (output.Count >= 60) return;
+    foreach (string dir in roots) {
+     if (String.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+     int maxDepth = dir.IndexOf("Start Menu", StringComparison.OrdinalIgnoreCase) >= 0 ? 2 : 1;
+     ScanShortcuts(dir, 0, maxDepth, seen, result, limit, ref shell);
+     if (result.Count == limit) break;
+    }
+   } finally { Release(shell); }
+   return result;
+  }
+  static void ScanShortcuts(string dir, int depth, int maxDepth, HashSet<string> seen, List<DeskItem> output, int limit, ref object shell) {
+   try {
+    foreach (string file in Directory.EnumerateFiles(dir)) {
      string ext = Path.GetExtension(file);
      if (!ext.Equals(".lnk", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".exe", StringComparison.OrdinalIgnoreCase)) continue;
      string name = Path.GetFileNameWithoutExtension(file);
@@ -203,13 +237,15 @@ namespace MacDesk.Core {
          name.IndexOf("使用说明", StringComparison.OrdinalIgnoreCase) >= 0) continue;
      if (seen.Contains(name)) continue;
      try {
-      DeskItem item = FromPath(file);
+      DeskItem item = FromPath(file, ref shell);
       if (item.type == "app" && seen.Add(name)) output.Add(item);
      } catch { }
+     if (output.Count == limit) return;
     }
     if (depth < maxDepth) {
-     foreach (string sub in Directory.GetDirectories(dir)) {
-      ScanShortcuts(sub, depth + 1, maxDepth, seen, output);
+     foreach (string sub in Directory.EnumerateDirectories(dir)) {
+      ScanShortcuts(sub, depth + 1, maxDepth, seen, output, limit, ref shell);
+      if (output.Count == limit) return;
      }
     }
    } catch { }

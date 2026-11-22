@@ -155,6 +155,7 @@ namespace MacDeskNative {
    // Backend.
    CoreTests.Run(Path.Combine(root,"core"));
    CheckBackdropSampling();
+   CheckFolderGlass();
    CheckCompactCalendar();
    CheckDesktopGrid();
    // Frontend: springs, controller wiring, folder transition.
@@ -206,6 +207,29 @@ namespace MacDeskNative {
     app.Quit();
    }
    File.WriteAllText(Path.Combine(root,"PASS.txt"),"Backend (CoreTests) and frontend self-tests passed.");
+  }
+  static void CheckFolderGlass() {
+   var view = new Rectangle(-210, 95, 96, 64);
+   var clip = new Rectangle(view.Left + 13, view.Top + 8, 37, 42);
+   var shape = new RectangleF(view.Left + 7.2f, view.Top + 4.6f, 72.4f, 51.7f);
+   using (var source = new Bitmap(view.Width, view.Height)) {
+    using (var g = Graphics.FromImage(source)) {
+     g.Clear(Color.SteelBlue);
+     using (var brush = new SolidBrush(Color.Firebrick)) g.FillRectangle(brush, 0, 0, 24, view.Height);
+    }
+    using (var backdrop = Backdrop.FromImage(source, view))
+    using (var full = new Bitmap(view.Width, view.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
+    using (var cropped = new Bitmap(clip.Width, clip.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb)) {
+     var glass = new FolderGlass(backdrop, view);
+     Check(glass.Paint(full, view, shape, 16) && glass.Paint(cropped, clip, shape, 16), "glass paint inside backdrop");
+     Check(full.GetPixel(0, 0).A == 0 && full.GetPixel(30, 26).A == 255, "glass keeps transparent exterior and opaque interior");
+     Check(full.GetPixel(29, 4).A > 0 && full.GetPixel(29, 4).A < 255, "glass samples partial coverage at a fractional edge");
+     Check(full.GetPixel(18, 26).ToArgb() != full.GetPixel(59, 26).ToArgb(), "glass retains screen-aligned backdrop texture");
+     for (int y = 0; y < clip.Height; y++)
+      for (int x = 0; x < clip.Width; x++)
+       Check(cropped.GetPixel(x, y) == full.GetPixel(x + clip.Left - view.Left, y + clip.Top - view.Top), "glass is invariant to canvas clipping");
+    }
+   }
   }
   static void CheckDesktopGrid() {
    var work = new Rectangle(0, 40, 1920, 1000);
@@ -261,8 +285,9 @@ namespace MacDeskNative {
     using (var whole = backdrop.CopyRegion(area))
     using (var crop = backdrop.CopyRegion(new Rectangle(area.X + 17, area.Y + 11, 31, 23)))
     using (var dimmed = backdrop.TakeDimmed()) {
-     Check(dimmed.Size == area.Size && dimmed.GetPixel(40, 26).A == 255, "opaque dimmed backdrop");
-     Check(dimmed.GetPixel(40, 26).GetBrightness() < whole.GetPixel(40, 26).GetBrightness(), "backdrop dimming");
+     var dimmedPixel = Color.FromArgb(System.Runtime.InteropServices.Marshal.ReadInt32(dimmed.Pixels, 26 * dimmed.Stride + 40 * 4));
+     Check(dimmed.Size == area.Size && dimmedPixel.A == 255, "opaque dimmed backdrop");
+     Check(dimmedPixel.GetBrightness() < whole.GetPixel(40, 26).GetBrightness(), "backdrop dimming");
      Check(whole.GetPixel(0, 0) != whole.GetPixel(area.Width - 1, area.Height - 1), "backdrop preserves the gradient");
      for (int y = 0; y < crop.Height; y++)
       for (int x = 0; x < crop.Width; x++)

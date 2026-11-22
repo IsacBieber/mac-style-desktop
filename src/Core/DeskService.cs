@@ -271,6 +271,7 @@ namespace MacDesk.Core {
     int existing = items.FindIndex(v => String.Equals(v.target, candidate.target, StringComparison.OrdinalIgnoreCase));
     if (existing >= 0) { items.RemoveAt(existing); added = false; }
     else {
+     EntryServices.ValidateTarget(candidate.type, candidate.target, true);
      items.Add(new DeskItem { id = DesktopStore.NewId(), title = candidate.title, description = candidate.description ?? "", type = candidate.type, target = candidate.target, icon = candidate.icon ?? "", arguments = candidate.arguments ?? "" });
      added = true;
     }

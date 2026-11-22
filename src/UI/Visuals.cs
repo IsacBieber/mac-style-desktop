@@ -40,13 +40,18 @@ namespace MacDeskNative {
   internal static readonly Color SecondaryLabel = Color.FromArgb(190, 235, 235, 245);
   internal static readonly Color TertiaryLabel = Color.FromArgb(120, 235, 235, 245);
 
-  // Continuous ("squircle") corners: the curve starts earlier than a circular arc and
+   internal const float SquircleControlRatio = 0.348f / 1.3f;
+   internal static float SquircleCorner(RectangleF r, float radius) {
+    return Math.Min(radius * 1.3f, Math.Min(r.Width, r.Height) * 0.5f);
+   }
+
+   // Continuous ("squircle") corners: the curve starts earlier than a circular arc and
   // eases into the straight edge, which is what makes Apple shapes look soft.
   internal static GraphicsPath Squircle(RectangleF r, float radius) {
    var p = new GraphicsPath();
    if (r.Width < 2 || r.Height < 2) { p.AddRectangle(r); return p; }
-   float a = Math.Min(radius * 1.3f, Math.Min(r.Width, r.Height) * 0.5f);
-   float c = a * (0.348f / 1.3f);
+    float a = SquircleCorner(r, radius);
+    float c = a * SquircleControlRatio;
    float x0 = r.Left, y0 = r.Top, x1 = r.Right, y1 = r.Bottom;
    p.StartFigure();
    p.AddLine(x0 + a, y0, x1 - a, y0);
@@ -128,12 +133,19 @@ namespace MacDeskNative {
   // Draws a bitmap with a constant opacity (fast path when fully opaque).
   internal static void Blit(Graphics g, Image image, int x, int y, float alpha, System.Drawing.Imaging.ImageAttributes scratch, System.Drawing.Imaging.ColorMatrix matrix) {
    if (alpha >= 0.995f) { Blit(g, image, x, y); return; }
+   Blit(g, image, x, y, new Rectangle(0, 0, image.Width, image.Height), alpha, scratch, matrix);
+  }
+
+  // The source stays aligned with its original position when skipping transparent margins.
+  internal static void Blit(Graphics g, Image image, int x, int y, Rectangle source, float alpha, ImageAttributes scratch, ColorMatrix matrix) {
    if (alpha <= 0.005f) return;
+   var destination = source;
+   destination.Offset(x, y);
    matrix.Matrix33 = alpha;
    scratch.SetColorMatrix(matrix);
    var im = g.InterpolationMode;
    g.InterpolationMode = InterpolationMode.NearestNeighbor;
-   g.DrawImage(image, new Rectangle(x, y, image.Width, image.Height), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, scratch);
+   g.DrawImage(image, destination, source.X, source.Y, source.Width, source.Height, GraphicsUnit.Pixel, scratch);
    g.InterpolationMode = im;
   }
 
@@ -186,7 +198,8 @@ namespace MacDeskNative {
  // Persistent 32bpp premultiplied DIB for UpdateLayeredWindow: no per-frame allocation and
  // optional dirty-rect presentation (only the changed pixels are sent to DWM).
  internal sealed class LayeredSurface : IDisposable {
-  IntPtr screen, memory, dib, previous, bits, scratch;
+  IntPtr screen, memory, previous, scratch;
+  PixelFrame frame;
   Bitmap bitmap;
   Graphics graphics;
   Size size, capacity;
@@ -195,7 +208,8 @@ namespace MacDeskNative {
 
   // Diagnostics: save what is currently presented (premultiplied) as a PNG.
   public void SaveSnapshot(string path) {
-   if (bitmap == null) return;
+   if (frame == null) return;
+   EnsureGraphics();
    graphics.Flush(FlushIntention.Sync);
    using (var copy = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppArgb))
    using (var g = Graphics.FromImage(copy)) {
@@ -207,42 +221,61 @@ namespace MacDeskNative {
 
   // Alpha of a presented pixel (diagnostics: the OS hit-tests layered windows by alpha).
   public int AlphaAt(int x, int y) {
-   if (bitmap == null || x < 0 || y < 0 || x >= size.Width || y >= size.Height) return 0;
-   graphics.Flush(FlushIntention.Sync);
-   return (Marshal.ReadInt32(bits, (y * capacity.Width + x) * 4) >> 24) & 255;
+   if (frame == null || x < 0 || y < 0 || x >= size.Width || y >= size.Height) return 0;
+   if (graphics != null) graphics.Flush(FlushIntention.Sync);
+   return (Marshal.ReadInt32(frame.Pixels, (y * capacity.Width + x) * 4) >> 24) & 255;
   }
 
   // Keeps a DIB at least this large, so a window that grows every frame (the folder morph)
   // never reallocates mid-animation.
   public void Reserve(Size wanted) {
-   if (bitmap == null || wanted.Width > capacity.Width || wanted.Height > capacity.Height)
+   if (frame == null || wanted.Width > capacity.Width || wanted.Height > capacity.Height)
     Allocate(new Size(Math.Max(wanted.Width, capacity.Width), Math.Max(wanted.Height, capacity.Height)));
   }
 
   public Graphics Begin(Size wanted) {
    if (wanted.Width < 1 || wanted.Height < 1) wanted = new Size(Math.Max(1, wanted.Width), Math.Max(1, wanted.Height));
-   if (bitmap == null || wanted.Width > capacity.Width || wanted.Height > capacity.Height)
+   if (frame == null || wanted.Width > capacity.Width || wanted.Height > capacity.Height)
     Allocate(new Size(Math.Max(wanted.Width, capacity.Width * 5 / 4), Math.Max(wanted.Height, capacity.Height * 5 / 4)));
+   EnsureGraphics();
    size = wanted;
    graphics.ResetTransform();
    graphics.SetClip(new Rectangle(Point.Empty, size));
    return graphics;
   }
 
+  internal IntPtr FlushPixelBuffer(out int stride) {
+   if (graphics != null) graphics.Flush(FlushIntention.Sync);
+   stride = frame.Stride;
+   return frame.Pixels;
+  }
+
+  void EnsureGraphics() {
+   if (graphics != null) return;
+   try {
+    bitmap = new Bitmap(capacity.Width, capacity.Height, frame.Stride, PixelFormat.Format32bppPArgb, frame.Pixels);
+    graphics = Graphics.FromImage(bitmap);
+    Ui.PrepareQuality(graphics);
+   } catch { Release(); throw; }
+  }
+
   void Allocate(Size wanted) {
+   UseFrame(new PixelFrame(wanted));
+  }
+
+  // Takes ownership of a finished DIB. Its DC and Graphics belong to the UI thread.
+  internal void UseFrame(PixelFrame ready) {
    Release();
-   capacity = wanted;
-   screen = GetDC(IntPtr.Zero);
-   memory = CreateCompatibleDC(screen);
-   if (screen == IntPtr.Zero || memory == IntPtr.Zero) throw new Win32Exception();
-   var info = new INFO { Size = Marshal.SizeOf(typeof(INFO)), W = wanted.Width, H = -wanted.Height, Planes = 1, BitCount = 32 };
-   dib = CreateDIBSection(screen, ref info, 0, out bits, IntPtr.Zero, 0);
-   if (dib == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
-   previous = SelectObject(memory, dib);
-   bitmap = new Bitmap(wanted.Width, wanted.Height, wanted.Width * 4, PixelFormat.Format32bppPArgb, bits);
-   graphics = Graphics.FromImage(bitmap);
-   Ui.PrepareQuality(graphics);
-   scratch = Marshal.AllocHGlobal(128);
+   frame = ready;
+   size = capacity = ready.Size;
+   try {
+    screen = GetDC(IntPtr.Zero);
+    memory = CreateCompatibleDC(screen);
+    if (screen == IntPtr.Zero || memory == IntPtr.Zero) throw new Win32Exception();
+    previous = SelectObject(memory, ready.Handle);
+    if (previous == IntPtr.Zero) throw new Win32Exception();
+    scratch = Marshal.AllocHGlobal(128);
+   } catch { Release(); throw; }
   }
 
   // Clears a region to fully transparent (alpha 0) without touching anything else.
@@ -256,8 +289,8 @@ namespace MacDeskNative {
 
   // position == null keeps the window where it is (required for WS_CHILD layered windows).
   public void Present(IntPtr hwnd, Point? position, byte alpha, Rectangle? dirty) {
-   if (bitmap == null || hwnd == IntPtr.Zero) return;
-   graphics.Flush(FlushIntention.Sync);
+   if (frame == null || hwnd == IntPtr.Zero) return;
+   if (graphics != null) graphics.Flush(FlushIntention.Sync);
    // scratch layout: [0] POINT dst, [8] SIZE, [16] POINT src, [24] BLEND, [32] RECT dirty
    Marshal.WriteInt32(scratch, 0, position.HasValue ? position.Value.X : 0);
    Marshal.WriteInt32(scratch, 4, position.HasValue ? position.Value.Y : 0);
@@ -305,13 +338,33 @@ namespace MacDeskNative {
   void Release() {
    if (graphics != null) { graphics.Dispose(); graphics = null; }
    if (bitmap != null) { bitmap.Dispose(); bitmap = null; }
-   if (dib != IntPtr.Zero) { SelectObject(memory, previous); DeleteObject(dib); dib = IntPtr.Zero; }
+   if (previous != IntPtr.Zero) { SelectObject(memory, previous); previous = IntPtr.Zero; }
+   if (frame != null) { frame.Dispose(); frame = null; }
    if (memory != IntPtr.Zero) { DeleteDC(memory); memory = IntPtr.Zero; }
    if (screen != IntPtr.Zero) { ReleaseDC(IntPtr.Zero, screen); screen = IntPtr.Zero; }
    if (scratch != IntPtr.Zero) { Marshal.FreeHGlobal(scratch); scratch = IntPtr.Zero; }
    size = capacity = Size.Empty;
   }
   public void Dispose() { Release(); }
+
+  internal sealed class PixelFrame : IDisposable {
+   internal readonly Size Size;
+   internal readonly IntPtr Pixels;
+   internal IntPtr Handle { get; private set; }
+   internal int Stride { get { return Size.Width * 4; } }
+
+   internal PixelFrame(Size size) {
+    Size = size;
+    var info = new INFO { Size = Marshal.SizeOf(typeof(INFO)), W = size.Width, H = -size.Height, Planes = 1, BitCount = 32 };
+    Handle = CreateDIBSection(IntPtr.Zero, ref info, 0, out Pixels, IntPtr.Zero, 0);
+    if (Handle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+   }
+   public void Dispose() {
+    if (Handle == IntPtr.Zero) return;
+    DeleteObject(Handle);
+    Handle = IntPtr.Zero;
+   }
+  }
 
   [StructLayout(LayoutKind.Sequential)] struct INFO { public int Size, W, H; public short Planes, BitCount; public int Compression, ImageSize, XPels, YPels, Used, Important; }
   [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLEND { public byte Operation, Flags, Alpha, Format; }
@@ -330,7 +383,7 @@ namespace MacDeskNative {
  // Frosted material source: a heavily blurred, slightly saturated copy of some screen area.
  internal sealed class Backdrop : IDisposable {
   public Bitmap Image { get; private set; }
-  public Bitmap Dimmed { get; private set; }  // Image with the folder-backdrop dim baked in
+  private LayeredSurface.PixelFrame dimmed;
   public Rectangle Area { get; private set; } // screen coordinates covered by Image
 
   Backdrop(Bitmap image, Rectangle area) { Image = image; Area = area; }
@@ -348,20 +401,27 @@ namespace MacDeskNative {
 
   public static Backdrop FromCapture(Image source, Rectangle area) {
    Bitmap small = BlurSmall(source, area.Size, 6, 1.35f);
+   LayeredSurface.PixelFrame frame = null;
    try {
     using (var dark = small.Clone(new Rectangle(Point.Empty, small.Size), PixelFormat.Format32bppPArgb)) {
      using (var g = Graphics.FromImage(dark))
      using (var b = new SolidBrush(Color.FromArgb(BackdropDim, 0, 0, 0))) g.FillRectangle(b, 0, 0, dark.Width, dark.Height);
-     return new Backdrop(small, area) { Dimmed = ExpandBlur(dark, area.Size, new Rectangle(Point.Empty, area.Size)) };
+     frame = new LayeredSurface.PixelFrame(area.Size);
+     ExpandBlurInto(dark, area.Size, new Rectangle(Point.Empty, area.Size), frame.Pixels, frame.Stride);
+     return new Backdrop(small, area) { dimmed = frame };
     }
-   } catch { small.Dispose(); throw; }
+   } catch { if (frame != null) frame.Dispose(); small.Dispose(); throw; }
   }
 
   public static Backdrop FromImage(Image source, Rectangle area) {
    return new Backdrop(BlurSmall(source, area.Size, 8, 1.25f), area);
   }
 
-  public Bitmap TakeDimmed() { Bitmap image = Dimmed; Dimmed = null; return image; }
+  internal LayeredSurface.PixelFrame TakeDimmed() {
+   var frame = dimmed;
+   dimmed = null;
+   return frame;
+  }
 
   public Bitmap CopyRegion(Rectangle region) {
    region.Offset(-Area.X, -Area.Y);
@@ -397,6 +457,16 @@ namespace MacDeskNative {
   // Bilinear sampling of opaque blurred pixels. Each source row is expanded at most once,
   // then reused for every output row that interpolates between that pair.
   static Bitmap ExpandBlur(Bitmap small, Size full, Rectangle region) {
+   var result = new Bitmap(region.Width, region.Height, PixelFormat.Format32bppPArgb);
+   try {
+    var output = result.LockBits(new Rectangle(Point.Empty, result.Size), ImageLockMode.WriteOnly, result.PixelFormat);
+    try { ExpandBlurInto(small, full, region, output.Scan0, output.Stride); }
+    finally { result.UnlockBits(output); }
+    return result;
+   } catch { result.Dispose(); throw; }
+  }
+
+  static void ExpandBlurInto(Bitmap small, Size full, Rectangle region, IntPtr output, int stride) {
    var pixels = new int[small.Width * small.Height];
    var source = small.LockBits(new Rectangle(Point.Empty, small.Size), ImageLockMode.ReadOnly, small.PixelFormat);
    try {
@@ -408,35 +478,28 @@ namespace MacDeskNative {
    for (int x = 0; x < columns.Length; x++) columns[x] = SamplePosition(region.X + x, small.Width, full.Width);
    int[] upper = new int[region.Width], lower = new int[region.Width], row = new int[region.Width];
    int upperIndex = -1, lowerIndex = -1;
-   var result = new Bitmap(region.Width, region.Height, PixelFormat.Format32bppPArgb);
-   try {
-    var output = result.LockBits(new Rectangle(Point.Empty, result.Size), ImageLockMode.WriteOnly, result.PixelFormat);
-    try {
-     for (int y = 0; y < region.Height; y++) {
-      int sample = SamplePosition(region.Y + y, small.Height, full.Height);
-      int y0 = sample >> 8, y1 = Math.Min(small.Height - 1, y0 + 1);
-      if (upperIndex != y0) {
-       if (lowerIndex == y0) {
-        int[] previousUpper = upper; upper = lower; lower = previousUpper;
-        lowerIndex = upperIndex;
-       } else ExpandRow(pixels, small.Width, y0, columns, upper);
-       upperIndex = y0;
-      }
-      if ((sample & 255) == 0) {
-       Marshal.Copy(upper, 0, IntPtr.Add(output.Scan0, y * output.Stride), region.Width);
-       continue;
-      }
-      if (lowerIndex != y1) {
-       ExpandRow(pixels, small.Width, y1, columns, lower);
-       lowerIndex = y1;
-      }
-      uint fraction = (uint)(sample & 255);
-      for (int x = 0; x < row.Length; x++) row[x] = MixOpaque(upper[x], lower[x], fraction);
-      Marshal.Copy(row, 0, IntPtr.Add(output.Scan0, y * output.Stride), region.Width);
-     }
-    } finally { result.UnlockBits(output); }
-    return result;
-   } catch { result.Dispose(); throw; }
+   for (int y = 0; y < region.Height; y++) {
+    int sample = SamplePosition(region.Y + y, small.Height, full.Height);
+    int y0 = sample >> 8, y1 = Math.Min(small.Height - 1, y0 + 1);
+    if (upperIndex != y0) {
+     if (lowerIndex == y0) {
+      int[] previousUpper = upper; upper = lower; lower = previousUpper;
+      lowerIndex = upperIndex;
+     } else ExpandRow(pixels, small.Width, y0, columns, upper);
+     upperIndex = y0;
+    }
+    if ((sample & 255) == 0) {
+     Marshal.Copy(upper, 0, IntPtr.Add(output, y * stride), region.Width);
+     continue;
+    }
+    if (lowerIndex != y1) {
+     ExpandRow(pixels, small.Width, y1, columns, lower);
+     lowerIndex = y1;
+    }
+    uint fraction = (uint)(sample & 255);
+    for (int x = 0; x < row.Length; x++) row[x] = MixOpaque(upper[x], lower[x], fraction);
+    Marshal.Copy(row, 0, IntPtr.Add(output, y * stride), region.Width);
+   }
   }
 
   static int SamplePosition(int pixel, int sourceLength, int destinationLength) {
@@ -510,8 +573,8 @@ namespace MacDeskNative {
   }
 
   public void Dispose() {
+   if (dimmed != null) { dimmed.Dispose(); dimmed = null; }
    if (Image != null) { Image.Dispose(); Image = null; }
-   if (Dimmed != null) { Dimmed.Dispose(); Dimmed = null; }
   }
  }
 

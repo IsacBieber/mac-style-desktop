@@ -20,11 +20,34 @@ namespace MacDeskNative {
   public bool ModalInProgress { get { return modalDepth > 0; } }
   int modalDepth;
   public FolderLayer Panel { get; private set; }
+  internal AppCatalog Catalog { get; private set; }
 
   NotifyIcon tray;
   bool closing, refreshQueued, testMode;
+  readonly HashSet<string> launchingApps = new HashSet<string>();
+  int panelSession;
   BackdropOverlay dim;
   Backdrop backdrop;
+  IconLoader icons;
+
+  internal void EnableBackgroundIcons() {
+   if (icons != null) return;
+   icons = new IconLoader(
+    () => Panel == null || !Panel.Visible || (!Panel.IsOpening && !Panel.IsClosing),
+    ready => {
+     if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.RefreshIcons(ready);
+     if (Panel != null && Panel.Visible) Panel.RefreshIcons();
+    });
+  }
+
+  internal Bitmap GetIcon(DeskItem item, bool priority) {
+   return icons == null ? FolderLayer.CachedIcon(item) : icons.Get(item, priority);
+  }
+
+  internal void RefreshAppCatalog() {
+   if (closing || !Home.IsHandleCreated) return;
+   Catalog.Refresh(action => Home.BeginInvoke(action), delegate { if (!closing && Panel != null) Panel.UpdateAppCatalog(); });
+  }
 
   // Copy the desktop before the panel exists. A worker prepares its blur independently of the
   // click; opening can present immediately even if the worker is still running.
@@ -133,6 +156,7 @@ namespace MacDeskNative {
    testMode = !show;
    try {
     Service = new DeskService(root);
+    Catalog = new AppCatalog(Service.Root);
     Service.Changed += delegate { QueueRefresh(); };
     if (seedIfEmpty) Service.SeedStarterGroupsIfNew();
     // Desktop folders are laid out by order on a fixed grid (like a phone home screen);
@@ -144,6 +168,7 @@ namespace MacDeskNative {
     Home.HandleCreated += delegate { if (!testMode) NativeDesktop.Lower(Home.Handle); };
     Home.Shown += delegate { NativeDesktop.Lower(Home.Handle); };
     if (show) {
+      EnableBackgroundIcons();
      DesktopFolders = new DesktopFolderForm(this);
      DesktopFolders.FormClosed += delegate { Quit(); };
      DesktopFolders.HandleCreated += delegate { if (!testMode) NativeDesktop.SetCompanion(DesktopFolders.Handle); };
@@ -157,7 +182,7 @@ namespace MacDeskNative {
      DesktopFolders.ReflowWidgets();
      CreateTray();
      NativeDesktopHost.HideDesktopIcons(Home.Handle, DesktopFolders.Handle);
-     ThreadPool.QueueUserWorkItem(delegate { try { EntryServices.DiscoverSystemApps(); } catch { } });
+     RefreshAppCatalog();
     }
    } catch { Quit(); throw; }
   }
@@ -258,6 +283,7 @@ namespace MacDeskNative {
    try {
     Group(id);
     if (Panel != null && Panel.GroupId == id && Panel.Visible && !Panel.IsClosing) { ClosePanel(); return; }
+     panelSession++;
     if (Panel != null && !Panel.IsDisposed && Panel.Visible) Panel.Hide(); // switching folders
     if (Panel == null || Panel.IsDisposed) Panel = new FolderLayer(this, id);
     Rectangle tile = Rectangle.Empty;
@@ -383,7 +409,29 @@ namespace MacDeskNative {
   public void MoveItem(string sourceGroup, string itemId, string targetGroup, int index) { TryMoveItem(sourceGroup, itemId, targetGroup, index); }
   public void MoveGroup(string id, int index) { TryMoveGroup(id, index); }
   public void Launch(string groupId, string itemId) {
-   if (Try(delegate { Service.Launch(groupId, itemId); })) ClosePanel();
+   DeskItem item = Service.FindItem(groupId, itemId);
+   if (item == null) { Fail(new InvalidDataException("条目已删除。")); return; }
+   if (item.type != "app") {
+    if (Try(delegate { Service.Launch(groupId, itemId); })) ClosePanel();
+    return;
+   }
+   if (launchingApps.Contains(itemId)) return;
+   int session = panelSession;
+   // Run ShellExecute away from the animation loop. Windows can take time to
+   // resolve the shortcut or prompt for elevation even with a responsive panel.
+   var ui = TaskScheduler.FromCurrentSynchronizationContext();
+   launchingApps.Add(itemId);
+   Task.Factory.StartNew(() => EntryServices.OpenDesktopApp(item), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default)
+    .ContinueWith(task => {
+     launchingApps.Remove(itemId);
+     Exception error = task.Exception;
+     if (closing) return;
+     if (error != null) { Fail(error.GetBaseException()); return; }
+     if (session != panelSession || Panel == null || Panel.IsDisposed || !Panel.Visible) return;
+     if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.SetOpenFolder(null);
+     Panel.Hide();
+     HideDim();
+    }, ui);
   }
   public void RunEntryAction(Action action, bool closeAfter) {
    if (Try(action) && closeAfter) ClosePanel();
@@ -459,6 +507,7 @@ namespace MacDeskNative {
    try {
     HideDim();
     DiscardPrefetch();
+    if (icons != null) { icons.Dispose(); icons = null; }
     if (Panel != null) Panel.Dispose();
     if (tray != null) { tray.Visible = false; tray.Dispose(); }
     if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.Dispose();

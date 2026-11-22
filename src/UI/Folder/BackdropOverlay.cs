@@ -1,10 +1,6 @@
 using System;
 using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
 using System.Windows.Forms;
-
-using MacDesk.Core;
 
 namespace MacDeskNative {
  // iOS-style backdrop while a folder is open: the whole screen, blurred and dimmed.
@@ -18,7 +14,7 @@ namespace MacDeskNative {
   IntPtr cachedHandle;
   byte alpha;
   double requestedAlpha;
-  bool preparing;
+  bool preparing, hasFrame;
 
   internal BackdropOverlay(Rectangle bounds, Form owner, Backdrop backdrop, bool preparing, Action outsideClick) {
    this.outsideClick = outsideClick;
@@ -32,18 +28,15 @@ namespace MacDeskNative {
    Text = "MacDesk Backdrop";
    Bounds = bounds;
    cachedHandle = Handle;
-   SetImage(backdrop);
+   if (!preparing) SetImage(backdrop);
   }
 
   void SetImage(Backdrop backdrop) {
-   var g = surface.Begin(ClientSize);
-   g.CompositingMode = CompositingMode.SourceCopy;
-   using (var image = backdrop == null ? null : backdrop.TakeDimmed()) {
-    if (image == null) g.Clear(Color.FromArgb(150, 8, 10, 14));
-    else Ui.Blit(g, image, backdrop.Area.X - Left, backdrop.Area.Y - Top);
-   }
-   g.CompositingMode = CompositingMode.SourceOver;
+   var frame = backdrop == null ? null : backdrop.TakeDimmed();
+   if (frame != null) surface.UseFrame(frame);
+   else surface.Begin(ClientSize).Clear(Color.FromArgb(150, 8, 10, 14));
    surface.Present(cachedHandle, Location, alpha, null);
+   hasFrame = true;
   }
 
   protected override bool ShowWithoutActivation { get { return true; } }
@@ -72,7 +65,7 @@ namespace MacDeskNative {
   }
 
   internal void FinishPreparing(Backdrop backdrop) {
-   if (backdrop != null) SetImage(backdrop);
+   if (backdrop != null || !hasFrame) SetImage(backdrop);
    preparing = false;
    reveal.Snap(0);
    reveal.Target = 1;
@@ -86,8 +79,8 @@ namespace MacDeskNative {
   }
 
   void PresentAlpha() {
-   // Keep the invisible click target alive while the worker finishes. When the image
-   // arrives, fade it in from transparent so a late result never flashes the desktop.
+   if (!hasFrame) return;
+   // Fade in a late result without flashing the desktop.
    double opacity = preparing ? 0 : requestedAlpha * reveal.Value;
    byte next = requestedAlpha <= 0 ? (byte)0 : (byte)Math.Max(2, Math.Min(255, (int)Math.Round(opacity * 255)));
    if (next != alpha && LayeredSurface.SetAlpha(cachedHandle, next / 255.0)) alpha = next;

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -39,8 +40,7 @@ namespace MacDeskNative {
 
   private readonly LayeredSurface surface = new LayeredSurface();
   private readonly FramePump pump;
-  private TextureBrush material;
-  private Point materialOrigin;
+  private FolderGlass material;
 
   private DeskGroup group;
   private int gridColumns = 4, pendingMenuActions;
@@ -167,26 +167,22 @@ namespace MacDeskNative {
   // The blurred screen behind the folder. Only the part under this window is copied (a full
   // screen copy is ~8 MB and used to stall the frame where the morph hands over to the panel).
   private Backdrop backdropSource;
-  private Rectangle materialArea;
   internal void SetBackdrop(Backdrop backdrop) {
    if (backdrop == backdropSource && (backdrop == null || material != null)) return;
    backdropSource = backdrop;
-   if (material != null) { material.Dispose(); material = null; }
+   material = null;
+   sheetCacheMaterial = null;
+   if (sheetCache != null) { sheetCache.Dispose(); sheetCache = null; }
    EnsureMaterial();
   }
   private void EnsureMaterial() {
    Backdrop bd = backdropSource;
-   if (bd == null || bd.Image == null) { if (material != null) { material.Dispose(); material = null; } return; }
+   if (bd == null || bd.Image == null) { material = null; return; }
    Rectangle window = PanelScreenRect();
    if (!tileRect.IsEmpty) window = Rectangle.Union(window, new Rectangle(tileRect.X + work.X, tileRect.Y + work.Y, tileRect.Width, tileRect.Height));
-   if (material != null && materialArea.Contains(window)) return;
+   if (material != null && material.Area.Contains(Rectangle.Intersect(window, bd.Area))) return;
    Rectangle crop = Rectangle.Intersect(Rectangle.Inflate(window, 48, 48), bd.Area);
-   if (crop.Width < 1 || crop.Height < 1) return;
-   if (material != null) material.Dispose();
-   using (var part = bd.CopyRegion(crop))
-    material = new TextureBrush(part, WrapMode.Clamp);
-   materialOrigin = crop.Location;
-   materialArea = crop;
+   material = crop.Width > 0 && crop.Height > 0 ? new FolderGlass(bd, crop) : null;
   }
 
 
@@ -236,7 +232,7 @@ namespace MacDeskNative {
    if (tileBody != null) tileBody.Dispose();
    tileBody = body;
    backdropSource = backdrop;
-   if (material != null) { material.Dispose(); material = null; }
+   material = null;
    EnsureSheetCache();
    CaptureTransitionGrid();
    progress.Snap(0);
@@ -428,16 +424,12 @@ namespace MacDeskNative {
    g.DrawImage(image, new[] { new PointF(dest.Left, dest.Top), new PointF(dest.Right, dest.Top), new PointF(dest.Left, dest.Bottom) }, new RectangleF(0, 0, image.Width, image.Height), GraphicsUnit.Pixel, transitionAttributes);
   }
 
-  private void DrawTransition(Graphics g, TransitionFrame f) {
-   using (var shape = Ui.Squircle(f.Frame, f.Radius)) {
-    if (material != null) {
-     material.ResetTransform();
-     material.TranslateTransform(materialOrigin.X - work.X, materialOrigin.Y - work.Y);
-    }
-    Material.Fill(g, shape, material, Material.SheetTint, Material.SheetFallback);
-    // First frames: the glass still looks exactly like the desktop folder icon.
-    if (tileBody != null && f.FaceAlpha > 0.01f) DrawScaled(g, tileBody, f.Frame, f.FaceAlpha);
-   }
+  private void DrawTransition(Graphics g, TransitionFrame f, bool glassPainted) {
+   if (!glassPainted)
+    using (var shape = Ui.Squircle(f.Frame, f.Radius))
+     Material.Fill(g, shape, null, Material.SheetTint, Material.SheetFallback);
+   // First frames: the glass still looks exactly like the desktop folder icon.
+   if (tileBody != null && f.FaceAlpha > 0.01f) DrawScaled(g, tileBody, f.Frame, f.FaceAlpha);
    Material.Rim(g, f.Frame, f.Radius, f.Rim);
    DrawTransitionItems(g, f);
    if (f.TitleAlpha > 0.01f) {
@@ -455,11 +447,16 @@ namespace MacDeskNative {
     if (it.IconAlpha > 0.005f) {
      Rectangle pixels = Metrics.IconPixels(it.Icon);
      if (it.Plus) DrawPlusGlyph(g, pixels, it.IconAlpha);
-     else Ui.DrawIcon(g, CachedIcon(it.Item), pixels, it.IconAlpha, blitAttributes, blitMatrix);
+     else Ui.DrawIcon(g, app.GetIcon(it.Item, true), pixels, it.IconAlpha, blitAttributes, blitMatrix);
     }
     if (it.LabelAlpha > 0.01f) {
      Bitmap label = CachedLabel(it.Label, it.SubLabel, it.Plus ? 0.85f : 1f);
-     Blit(g, label, it.LabelRect.X, it.LabelRect.Y, it.LabelAlpha);
+     int x = (int)Math.Round(it.LabelRect.X), y = (int)Math.Round(it.LabelRect.Y);
+     if (it.LabelAlpha >= 0.995f) Ui.Blit(g, label, x, y);
+     else {
+      Rectangle ink = labelInk.GetValue(label, measureLabelInk).Bounds;
+      if (!ink.IsEmpty) Ui.Blit(g, label, x, y, ink, it.LabelAlpha, blitAttributes, blitMatrix);
+     }
     }
    }
    g.Restore(state);
@@ -635,7 +632,8 @@ namespace MacDeskNative {
   private string TitleText() { return pickerMode ? "添加到「" + (group != null ? group.title : "") + "」" : (group != null ? group.title ?? "文件夹" : "文件夹"); }
 
   private Size ComputePanelSize() {
-   return FolderLayout.PanelSize(work.Size, pickerMode, groupAppCount, filtered.Count);
+   var catalog = app.Catalog.Items;
+   return FolderLayout.PanelSize(work.Size, pickerMode, groupAppCount, catalog == null ? 0 : catalog.Count);
   }
 
   // --- Data -----------------------------------------------------------------------------
@@ -655,10 +653,11 @@ namespace MacDeskNative {
    string query = (searchQuery ?? "").Trim();
    if (group != null) {
     if (pickerMode) {
-     List<DeskItem> apps = EntryServices.DiscoverSystemApps();
-     for (int i = 0; i < apps.Count; i++) {
+     var apps = app.Catalog.Items;
+     for (int i = 0; apps != null && i < apps.Count; i++) {
       DeskItem item = apps[i];
-      if (query.Length == 0 || Contains(item.title, query) || Contains(item.target, query))
+      if (query.Length == 0 || (item.title ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
+          item.target.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
        filtered.Add(new PanelEntry(item, i, group.id, group.title, false));
      }
     } else {
@@ -898,8 +897,18 @@ namespace MacDeskNative {
    surface.Reserve(Rectangle.Intersect(panelArea, workBounds).Size);
    var g = surface.Begin(canvas.Size);
    surface.Clear(new Rectangle(Point.Empty, canvas.Size));
+   bool glassPainted = false;
+   if (transition != null && material != null) {
+    Rectangle clip = canvas;
+    clip.Offset(work.Location);
+    RectangleF shape = transition.Frame;
+    shape.Offset(work.X, work.Y);
+    int stride;
+    IntPtr target = surface.FlushPixelBuffer(out stride);
+    glassPainted = material.Paint(target, stride, clip, shape, transition.Radius);
+   }
    g.TranslateTransform(-canvas.X, -canvas.Y);
-   if (transition != null) DrawTransition(g, transition);
+   if (transition != null) DrawTransition(g, transition, glassPainted);
    else {
     g.TranslateTransform(origin.X, origin.Y);
     RenderCanvas(g, false);
@@ -948,11 +957,13 @@ namespace MacDeskNative {
 
   private Bitmap sheetCache, titleCache;
   private Point sheetCacheOrigin;
-  private TextureBrush sheetCacheMaterial;
+  private FolderGlass sheetCacheMaterial;
   private string titleCacheText;
   // Shared by every folder panel (and the picker): an icon or label is rendered once per process.
   private static readonly BitmapCache iconCache = new BitmapCache(384);
   private static readonly BitmapCache labelCache = new BitmapCache(384);
+  private static readonly ConditionalWeakTable<Bitmap, LabelInk> labelInk = new ConditionalWeakTable<Bitmap, LabelInk>();
+  private static readonly ConditionalWeakTable<Bitmap, LabelInk>.CreateValueCallback measureLabelInk = MeasureLabelInk;
   private readonly System.Drawing.Imaging.ImageAttributes blitAttributes = new System.Drawing.Imaging.ImageAttributes();
   private readonly System.Drawing.Imaging.ColorMatrix blitMatrix = new System.Drawing.Imaging.ColorMatrix();
   private readonly HashSet<string> groupTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -966,7 +977,10 @@ namespace MacDeskNative {
     CachedLabel(item.title, null, 1f);
    }
    CachedLabel("添加", null, 0.85f);
-   if (includePicker) foreach (DeskItem item in EntryServices.DiscoverSystemApps()) { CachedIcon(item); CachedLabel(item.title, null, 1f); }
+   if (includePicker) {
+    app.Catalog.LoadForBenchmark();
+    foreach (DeskItem item in app.Catalog.Items) { CachedIcon(item); CachedLabel(item.title, null, 1f); }
+   }
   }
 
   private void DrawSheetBackground(Graphics g) {
@@ -986,20 +1000,17 @@ namespace MacDeskNative {
    if (sheetCache == null || sheetCache.Size != PanelSize || sheetCacheOrigin != screen || sheetCacheMaterial != material) {
     if (sheetCache != null) sheetCache.Dispose();
     sheetCache = new Bitmap(Math.Max(1, PanelSize.Width), Math.Max(1, PanelSize.Height), System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+    Rectangle sheet = SheetRect(), screenSheet = sheet;
+    screenSheet.Offset(screen);
+    bool glassPainted = material != null && material.Paint(sheetCache, new Rectangle(screen, PanelSize), screenSheet, SheetRadius);
     using (var cg = Graphics.FromImage(sheetCache)) {
-     cg.Clear(Color.Transparent);
      Ui.PrepareQuality(cg);
      // The transparent band above the sheet still catches clicks (alpha 1/255): clicking
      // there closes the folder instead of falling through to whatever is underneath.
      using (var catcher = new SolidBrush(Color.FromArgb(1, 0, 0, 0))) cg.FillRectangle(catcher, 0, 0, PanelSize.Width, TitleBand);
-     Rectangle sheet = SheetRect();
-     using (var shape = Ui.Squircle(sheet, SheetRadius)) {
-      if (material != null) {
-       material.ResetTransform();
-       material.TranslateTransform(materialOrigin.X - screen.X, materialOrigin.Y - screen.Y);
-      }
-      Material.Fill(cg, shape, material, Material.SheetTint, Material.SheetFallback);
-     }
+     if (!glassPainted)
+      using (var shape = Ui.Squircle(sheet, SheetRadius))
+       Material.Fill(cg, shape, null, Material.SheetTint, Material.SheetFallback);
      Material.Rim(cg, sheet, SheetRadius, 1f);
     }
     sheetCacheOrigin = screen;
@@ -1010,21 +1021,36 @@ namespace MacDeskNative {
   // Shared with the desktop folder's 3x3 preview, so the mini icons on the desktop and the ones
   // that fly out of it are the same pixels' source.
   internal static Bitmap CachedIcon(DeskItem item) {
-   string key = item.type + "|" + item.target + "|" + item.icon;
-   Bitmap bmp = iconCache.Get(key);
-   if (bmp != null) return bmp;
-   Image source;
-   try { source = IconProvider.Load(item); } catch { return null; }
-   using (source) {
-    bmp = new Bitmap(IconPx, IconPx, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-    using (var cg = Graphics.FromImage(bmp)) {
-     Ui.PrepareQuality(cg);
-     cg.DrawImage(source, new Rectangle(0, 0, IconPx, IconPx));
-    }
-   }
-   iconCache.Add(key, bmp);
+   string key = IconKey(item);
+   Bitmap bmp;
+   if (TryGetIcon(key, out bmp)) return bmp;
+   bmp = LoadIcon(item);
+   StoreIcon(key, bmp);
    return bmp;
   }
+
+  internal static string IconKey(DeskItem item) { return item.type + "|" + item.target + "|" + item.icon; }
+  internal static bool TryGetIcon(string key, out Bitmap bmp) { return iconCache.TryGet(key, out bmp); }
+  internal static void StoreIcon(string key, Bitmap bmp) { iconCache.Add(key, bmp); }
+
+  internal static Bitmap LoadIcon(DeskItem item) {
+   Bitmap bmp = null;
+   try {
+    using (var source = IconProvider.Load(item)) {
+     bmp = new Bitmap(IconPx, IconPx, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+     using (var cg = Graphics.FromImage(bmp)) {
+      Ui.PrepareQuality(cg);
+      cg.DrawImage(source, new Rectangle(0, 0, IconPx, IconPx));
+     }
+    }
+    return bmp;
+   } catch {
+    if (bmp != null) bmp.Dispose();
+    return null;
+   }
+  }
+
+  internal void RefreshIcons() { WakeAnimation(); }
 
   private Bitmap CachedLabel(string text, string sub, float bakedAlpha) {
    string key = (bakedAlpha < 1 ? "+" : "-") + (text ?? "") + "\u0001" + (sub ?? "");
@@ -1043,6 +1069,32 @@ namespace MacDeskNative {
    return bmp;
   }
 
+  private sealed class LabelInk {
+   internal Rectangle Bounds;
+  }
+
+  // Color-matrix fades are expensive over the empty padding around each label.
+  // Cache the alpha bounds with the bitmap, including the text shadow.
+  private static LabelInk MeasureLabelInk(Bitmap bitmap) {
+   var full = new Rectangle(Point.Empty, bitmap.Size);
+   var data = bitmap.LockBits(full, System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+   int left = full.Right, right = 0, top = full.Bottom, bottom = 0;
+   try {
+    var row = new int[full.Width];
+    for (int y = 0; y < full.Height; y++) {
+     Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), row, 0, row.Length);
+     for (int x = 0; x < row.Length; x++) {
+      if (row[x] == 0) continue;
+      left = Math.Min(left, x);
+      right = Math.Max(right, x + 1);
+      top = Math.Min(top, y);
+      bottom = y + 1;
+     }
+    }
+   } finally { bitmap.UnlockBits(data); }
+   return new LabelInk { Bounds = right > left ? Rectangle.FromLTRB(left, top, right, bottom) : Rectangle.Empty };
+  }
+
   private sealed class BitmapCache {
    private readonly int capacity;
    private readonly Dictionary<string, LinkedListNode<KeyValuePair<string, Bitmap>>> entries;
@@ -1054,10 +1106,17 @@ namespace MacDeskNative {
    }
 
    internal Bitmap Get(string key) {
+    Bitmap value;
+    TryGet(key, out value);
+    return value;
+   }
+
+   internal bool TryGet(string key, out Bitmap value) {
     LinkedListNode<KeyValuePair<string, Bitmap>> entry;
-    if (!entries.TryGetValue(key, out entry)) return null;
+    if (!entries.TryGetValue(key, out entry)) { value = null; return false; }
     if (entry != recent.First) { recent.Remove(entry); recent.AddFirst(entry); }
-    return entry.Value.Value;
+    value = entry.Value.Value;
+    return true;
    }
 
    internal void Add(string key, Bitmap bitmap) {
@@ -1065,7 +1124,7 @@ namespace MacDeskNative {
      var oldest = recent.Last.Value;
      entries.Remove(oldest.Key);
      recent.RemoveLast();
-     oldest.Value.Dispose();
+     if (oldest.Value != null) oldest.Value.Dispose();
     }
     entries.Add(key, recent.AddFirst(new KeyValuePair<string, Bitmap>(key, bitmap)));
    }
@@ -1143,7 +1202,7 @@ namespace MacDeskNative {
    var textRect = new RectangleF(r.X + 36, r.Y, r.Width - 48, r.Height);
    using (var f = Ui.Leading()) {
     if (searchQuery.Length == 0) {
-     string hint = pickerMode ? "搜索应用，或粘贴路径 / 网址后回车" : "搜索（含其他文件夹）";
+     string hint = pickerMode ? (app.Catalog.Loading ? "正在收集应用…" : "搜索应用，或粘贴路径 / 网址后回车") : "搜索（含其他文件夹）";
      using (var b = new SolidBrush(Ui.WithAlpha(Ui.SecondaryLabel, a))) g.DrawString(hint, searchFont, b, textRect, f);
     } else {
      using (var b = new SolidBrush(Ui.WithAlpha(Ui.Label, a))) g.DrawString(searchQuery, searchFont, b, textRect, f);
@@ -1206,7 +1265,7 @@ namespace MacDeskNative {
 
    PanelEntry entry = tile.Entry;
    if (entry == null) return;
-   Ui.DrawIcon(g, CachedIcon(entry.Item), iconBox, fade, blitAttributes, blitMatrix);
+   Ui.DrawIcon(g, app.GetIcon(entry.Item, true), iconBox, fade, blitAttributes, blitMatrix);
 
    if (!snapshot && pickerMode) {
     bool inGroup = entry.Item.target != null && groupTargets.Contains(entry.Item.target);
@@ -1507,8 +1566,16 @@ namespace MacDeskNative {
    searchActive = true;
    searchQuery = "";
    scroll.Snap(0);
+   app.RefreshAppCatalog();
    RefreshData();
    ResizeAroundCenter(ComputePanelSize());
+  }
+
+  internal void UpdateAppCatalog() {
+   if (!pickerMode || IsDisposed || Disposing || IsClosing) return;
+   RefreshData();
+   Size size = ComputePanelSize();
+   if (size != panelSize) ResizeAroundCenter(size);
   }
 
   private void ExitPickerMode() {
@@ -2092,7 +2159,7 @@ namespace MacDeskNative {
     foreach (ContextMenuStrip menu in new List<ContextMenuStrip>(activeMenus)) menu.Dispose();
     activeMenus.Clear();
     surface.Dispose();
-    if (material != null) { material.Dispose(); material = null; }
+     material = sheetCacheMaterial = null;
     if (sheetCache != null) { sheetCache.Dispose(); sheetCache = null; }
     if (titleCache != null) { titleCache.Dispose(); titleCache = null; }
     blitAttributes.Dispose();
