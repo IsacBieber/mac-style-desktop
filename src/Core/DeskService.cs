@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Web.Script.Serialization;
 
@@ -16,23 +17,61 @@ namespace MacDesk.Core {
  //   - FileNotFoundException: launching an entry whose target is gone
  //  Messages are user-facing Chinese; the UI shows them as-is.
  //  Threading: call from one thread (the UI thread). Changed fires synchronously after save.
+ //  The only methods safe on a worker thread are marked so (DiscoverApps, GetIcon, LoadIcon,
+ //  OpenAppOnWorker).
  // ============================================================================================
+
+ /// What a change touched, so views can skip work that does not concern them.
+ [Flags]
+ public enum DeskChange { None = 0, Groups = 1, Notes = 2, Todos = 4, Prefs = 8, All = Groups | Notes | Todos | Prefs }
+
+ /// Arguments of DeskService.Changed. Use DeskChangedEventArgs.KindsOf(e) in handlers.
+ public sealed class DeskChangedEventArgs : EventArgs {
+  public DeskChange Kinds { get; private set; }
+  public DeskChangedEventArgs(DeskChange kinds) { Kinds = kinds; }
+  /// The kinds carried by `e`, or All when the sender did not say.
+  public static DeskChange KindsOf(EventArgs e) { var c = e as DeskChangedEventArgs; return c == null ? DeskChange.All : c.Kinds; }
+ }
+
+ /// Extra ways to open an entry (context menu).
+ public enum EntryAction { Terminal, VSCode, Cursor, Reveal }
+ /// Folders the tray can open.
+ public enum DataFolder { Desktop, Backups }
+
  public sealed class DeskService {
   readonly DesktopStore store;
 
-  public DeskService(string root) { store = new DesktopStore(root); }
+  public DeskService(string root) {
+   store = new DesktopStore(root);
+   Catalog = new AppCatalog(store.Root);
+  }
 
   /// Folder holding desktop.json and Backups\.
   public string Root { get { return store.Root; } }
   /// Current data. Treat as read-only; it is replaced (not mutated) on every successful change.
   public DesktopData Data { get { return store.Data; } }
-  /// Raised after every successful change (and after Reload).
+  /// Raised after every successful change (and after Reload) with DeskChangedEventArgs.
   public event EventHandler Changed;
+  /// Installed-app catalog for the "add apps" page (refreshes on a worker).
+  internal AppCatalog Catalog { get; private set; }
 
-  public void Reload() { store.Reload(); OnChanged(); }
+  public void Reload() { store.Reload(); OnChanged(DeskChange.All); }
 
-  void Edit(Action<DesktopData> mutation) { store.Edit(mutation); OnChanged(); }
-  void OnChanged() { var h = Changed; if (h != null) h(this, EventArgs.Empty); }
+  void Edit(DeskChange kind, Action<DesktopData> mutation) { store.Edit(mutation); OnChanged(kind); }
+  void OnChanged(DeskChange kind) { var h = Changed; if (h != null) h(this, new DeskChangedEventArgs(kind)); }
+
+  /// Longest reminder title the store accepts.
+  public const int MaxTodoTitle = DesktopStore.MaxTodoTitle;
+
+  /// A fresh id (letters/digits), unique across folders, entries and reminders.
+  public static string NewId() { return DesktopStore.NewId(); }
+  /// Validates an entry target the same way saving does; returns the normalized target.
+  public static string ValidateTarget(string type, string target, bool mustExist) { return EntryServices.ValidateTarget(type, target, mustExist); }
+  /// True if the text looks like something AddPaths / AddUrl would accept (absolute path or http/https).
+  public static bool LooksLikeTarget(string text) {
+   if (String.IsNullOrWhiteSpace(text)) return false;
+   return EntryServices.IsAbsolutePath(text) || text.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || text.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+  }
 
   // ---- Queries -------------------------------------------------------------------------
 
@@ -74,7 +113,7 @@ namespace MacDesk.Core {
     else if (dev.items.Count < 4) dev.items.Add(item);
    }
    try {
-    Edit(d => { if (d.groups.Count > 0) return; d.groups.Add(dev); d.groups.Add(daily); d.groups.Add(games); d.groups.Add(tools); });
+    Edit(DeskChange.Groups, d => { if (d.groups.Count > 0) return; d.groups.Add(dev); d.groups.Add(daily); d.groups.Add(games); d.groups.Add(tools); });
    } catch { return false; }
    return true;
   }
@@ -90,7 +129,7 @@ namespace MacDesk.Core {
   /// Adds a fully-formed group (e.g. from the edit dialog). Its id must be unique.
   public void AddGroup(DeskGroup group) {
    if (group == null) throw new ArgumentNullException("group");
-   Edit(d => d.groups.Add(group));
+   Edit(DeskChange.Groups, d => d.groups.Add(group));
   }
 
   /// Creates an empty folder titled baseTitle, or "baseTitle 2/3/..." if taken. Returns it.
@@ -99,19 +138,19 @@ namespace MacDesk.Core {
    int n = 2;
    while (Data.groups.Exists(v => String.Equals(v.title, title, StringComparison.OrdinalIgnoreCase))) title = baseTitle + " " + n++;
    var g = NewGroup(title);
-   Edit(d => d.groups.Add(g));
+   Edit(DeskChange.Groups, d => d.groups.Add(g));
    return g;
   }
 
   public void RenameGroup(string groupId, string title) {
    string trimmed = (title ?? "").Trim();
    if (trimmed.Length == 0) throw new InvalidDataException("文件夹名称不能为空。");
-   Edit(d => { FindGroup(d, groupId).title = trimmed; });
+   Edit(DeskChange.Groups, d => { FindGroup(d, groupId).title = trimmed; });
   }
 
   /// Optimistic update: fails if title/subtitle changed since the caller read them.
   public void UpdateGroup(string groupId, string expectedTitle, string expectedSubtitle, string title, string subtitle) {
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     var current = FindGroup(d, groupId);
     if (current.title != expectedTitle || current.subtitle != expectedSubtitle) throw new InvalidDataException("分类名称已被其他操作修改，请重新编辑。");
     current.title = title;
@@ -120,12 +159,12 @@ namespace MacDesk.Core {
   }
 
   /// Removes the folder and its entries. Never touches the files the entries point to.
-  public void DeleteGroup(string groupId) { Edit(d => d.groups.RemoveAll(v => v.id == groupId)); }
+  public void DeleteGroup(string groupId) { Edit(DeskChange.Groups, d => d.groups.RemoveAll(v => v.id == groupId)); }
 
   /// Moves a folder in the list order; targetIndex is an insertion index in the current list
   /// (-1 = end).
   public void MoveGroup(string groupId, int targetIndex) {
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     int old = d.groups.FindIndex(v => v.id == groupId);
     if (old < 0) throw new InvalidDataException("分类已删除。");
     int index = targetIndex < 0 ? d.groups.Count : Math.Min(d.groups.Count, Math.Max(0, targetIndex));
@@ -136,40 +175,13 @@ namespace MacDesk.Core {
    });
   }
 
-  /// Pins a folder at a desktop position (clamped into `area`). Folders that are still
-  /// auto-placed get pinned at their current layout positions so nothing jumps.
-  public void SetGroupPosition(string groupId, int x, int y, IDictionary<string, Point> currentLayout, Size area) {
-   Edit(d => {
-    if (currentLayout != null)
-     foreach (var group in d.groups) { Point p; if (group.desktopX < 0 && currentLayout.TryGetValue(group.id, out p)) { group.desktopX = p.X; group.desktopY = p.Y; } }
-    var g = FindGroup(d, groupId);
-    g.desktopX = Math.Max(24, Math.Min(Math.Max(24, area.Width - 112), x));
-    g.desktopY = Math.Max(24, Math.Min(Math.Max(24, area.Height - 154), y));
-   });
-  }
-
-  /// Pins several folders at once (e.g. the dragged folder plus the ones that made room for
-  /// it), as one atomic save. Same clamping and auto-placed pinning as SetGroupPosition.
-  public void SetGroupPositions(IDictionary<string, Point> positions, IDictionary<string, Point> currentLayout, Size area) {
-   if (positions == null) throw new ArgumentNullException("positions");
-   Edit(d => {
-    if (currentLayout != null)
-     foreach (var group in d.groups) { Point p; if (group.desktopX < 0 && currentLayout.TryGetValue(group.id, out p)) { group.desktopX = p.X; group.desktopY = p.Y; } }
-    foreach (var pair in positions) {
-     var g = FindGroup(d, pair.Key);
-     g.desktopX = Math.Max(24, Math.Min(Math.Max(24, area.Width - 112), pair.Value.X));
-     g.desktopY = Math.Max(24, Math.Min(Math.Max(24, area.Height - 154), pair.Value.Y));
-    }
-   });
-  }
-
   /// One-time migration to order-only layout: folders that were pinned at desktop positions
   /// are re-ordered in reading order (top-to-bottom, then left-to-right) ahead of unpinned
   /// ones (which keep their relative order), and all pins are cleared. Returns true if it
   /// changed anything. The desktop UI lays folders out purely by list order.
   public bool MigratePinnedPositionsToOrder() {
    if (!Data.groups.Exists(g => g.desktopX >= 0)) return false;
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     var indexed = new List<KeyValuePair<int, DeskGroup>>();
     for (int i = 0; i < d.groups.Count; i++) indexed.Add(new KeyValuePair<int, DeskGroup>(i, d.groups[i]));
     indexed.Sort((a, b) => {
@@ -190,22 +202,19 @@ namespace MacDesk.Core {
    return true;
   }
 
-  /// Returns every folder to automatic grid placement.
-  public void ResetGroupPositions() { Edit(d => { foreach (var g in d.groups) { g.desktopX = -1; g.desktopY = -1; } }); }
-
   // ---- Entries (items) -----------------------------------------------------------------
 
   /// Adds files/folders/shortcuts by path (never moves or copies them). index -1 = end.
   public void AddPaths(string groupId, IEnumerable<string> paths, int index) {
    var entries = new List<DeskItem>();
    foreach (string path in paths) entries.Add(EntryServices.FromPath(path));
-   Edit(d => { var items = FindGroup(d, groupId).items; items.InsertRange(Clamp(index, items.Count), entries); });
+   Edit(DeskChange.Groups, d => { var items = FindGroup(d, groupId).items; items.InsertRange(Clamp(index, items.Count), entries); });
   }
 
   /// Adds an http/https link. index -1 = end.
   public void AddUrl(string groupId, string url, int index) {
    var item = EntryServices.FromUrl(url);
-   Edit(d => { var items = FindGroup(d, groupId).items; items.Insert(Clamp(index, items.Count), item); });
+   Edit(DeskChange.Groups, d => { var items = FindGroup(d, groupId).items; items.Insert(Clamp(index, items.Count), item); });
   }
 
   /// Adds a fully-formed item (e.g. from the edit dialog) at the end.
@@ -213,13 +222,13 @@ namespace MacDesk.Core {
    if (item == null) throw new ArgumentNullException("item");
    var entry = item.CopyForEdit();
    EntryServices.NormalizeAppShortcut(entry);
-   Edit(d => FindGroup(d, groupId).items.Add(entry));
+   Edit(DeskChange.Groups, d => FindGroup(d, groupId).items.Add(entry));
   }
 
   /// Optimistic replace: fails if the stored item differs from `expected` (what the caller edited).
   public void UpdateItem(string groupId, string itemId, DeskItem expected, DeskItem edited) {
    string baseline = Snapshot(expected);
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     var items = FindGroup(d, groupId).items;
     int i = items.FindIndex(v => v.id == itemId);
     if (i < 0) throw new InvalidDataException("条目已删除。");
@@ -234,7 +243,7 @@ namespace MacDesk.Core {
   public void RenameItem(string groupId, string itemId, string title) {
    string trimmed = (title ?? "").Trim();
    if (trimmed.Length == 0) throw new InvalidDataException("名称不能为空。");
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     var items = FindGroup(d, groupId).items;
     int i = items.FindIndex(v => v.id == itemId);
     if (i < 0) throw new InvalidDataException("条目已删除。");
@@ -243,12 +252,12 @@ namespace MacDesk.Core {
   }
 
   /// Removes the entry only (the target file is never deleted).
-  public void DeleteItem(string groupId, string itemId) { Edit(d => FindGroup(d, groupId).items.RemoveAll(v => v.id == itemId)); }
+  public void DeleteItem(string groupId, string itemId) { Edit(DeskChange.Groups, d => FindGroup(d, groupId).items.RemoveAll(v => v.id == itemId)); }
 
   /// Moves an entry within or between folders. insertIndex is an insertion index in the
   /// target list as it is *before* the move (-1 = end).
   public void MoveItem(string sourceGroupId, string itemId, string targetGroupId, int insertIndex) {
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     var source = FindGroup(d, sourceGroupId).items;
     var target = FindGroup(d, targetGroupId).items;
     int old = source.FindIndex(v => v.id == itemId);
@@ -266,7 +275,7 @@ namespace MacDesk.Core {
   public bool ToggleCandidate(string groupId, DeskItem candidate) {
    if (candidate == null) throw new ArgumentNullException("candidate");
    bool added = false;
-   Edit(d => {
+   Edit(DeskChange.Groups, d => {
     var items = FindGroup(d, groupId).items;
     int existing = items.FindIndex(v => String.Equals(v.target, candidate.target, StringComparison.OrdinalIgnoreCase));
     if (existing >= 0) { items.RemoveAt(existing); added = false; }
@@ -285,20 +294,93 @@ namespace MacDesk.Core {
 
   /// dateKey is "yyyy-MM-dd". Empty text removes the note. Line breaks become spaces.
   public void SetNote(string dateKey, string text) {
+   if (!DesktopStore.IsDateKey(dateKey)) throw new InvalidDataException("日期格式无效。");
    string trimmed = (text ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
-   Edit(d => {
+   if ((GetNote(dateKey) ?? "") == trimmed) return;
+   Edit(DeskChange.Notes, d => {
     if (d.notes == null) d.notes = new Dictionary<string, string>();
     if (trimmed.Length == 0) d.notes.Remove(dateKey); else d.notes[dateKey] = trimmed;
    });
   }
   public string GetNote(string dateKey) {
    string note = null;
-   if (Data.notes != null) Data.notes.TryGetValue(dateKey, out note);
+   if (Data.notes != null && dateKey != null) Data.notes.TryGetValue(dateKey, out note);
    return note;
   }
 
-  public void SetHomePosition(int x, int y) { Edit(d => { d.homeX = x; d.homeY = y; }); }
-  public void ToggleShowLabels() { Edit(d => { d.showLabels = !d.showLabels; }); }
+  public void SetHomePosition(int x, int y) { Edit(DeskChange.Prefs, d => { d.homeX = x; d.homeY = y; }); }
+  public void ToggleShowLabels() { Edit(DeskChange.Prefs, d => { d.showLabels = !d.showLabels; }); }
+
+  // ---- Reminders (todos) ---------------------------------------------------------------
+  // Dates are "yyyy-MM-dd" keys ("" = no date). Which day is "today" is the caller's choice;
+  // see TodoQueries for the views built from these.
+
+  /// Null when the reminder no longer exists.
+  public DeskTodo FindTodo(string todoId) {
+   return Data.todos == null ? null : Data.todos.Find(v => v.id == todoId);
+  }
+  static DeskTodo TodoIn(DesktopData d, string todoId) {
+   var t = d.todos.Find(v => v.id == todoId);
+   if (t == null) throw new InvalidDataException("待办已删除。");
+   return t;
+  }
+  static string TodoTitle(string title) {
+   string trimmed = (title ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+   if (trimmed.Length == 0) throw new InvalidDataException("待办内容不能为空。");
+   return trimmed;
+  }
+  static string TodoDue(string dateKey) {
+   if (String.IsNullOrEmpty(dateKey)) return "";
+   if (!DesktopStore.IsDateKey(dateKey)) throw new InvalidDataException("日期格式无效。");
+   return dateKey;
+  }
+  static string Stamp() { return DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture); }
+
+  /// Appends a reminder (dueDateKey "" or null = no date). Returns a copy of what was saved.
+  public DeskTodo AddTodo(string title, string dueDateKey) {
+   var todo = new DeskTodo { id = DesktopStore.NewId(), title = TodoTitle(title), due = TodoDue(dueDateKey), created = Stamp() };
+   Edit(DeskChange.Todos, d => d.todos.Add(todo.CopyForEdit()));
+   return todo;
+  }
+
+  public void RenameTodo(string todoId, string title) {
+   string trimmed = TodoTitle(title);
+   Edit(DeskChange.Todos, d => { TodoIn(d, todoId).title = trimmed; });
+  }
+
+  /// Marks a reminder done (stamping `completed`) or open again. No-op if already in that state.
+  public void SetTodoDone(string todoId, bool done) {
+   var current = FindTodo(todoId);
+   if (current != null && current.done == done) return;
+   string stamp = done ? Stamp() : "";
+   Edit(DeskChange.Todos, d => { var t = TodoIn(d, todoId); t.done = done; t.completed = stamp; });
+  }
+
+  /// Several done / open changes in one save (the UI batches quick successive ticks). Reminders
+  /// deleted in the meantime are skipped; entries already in the requested state are ignored.
+  public void SetTodosDone(IDictionary<string, bool> states) {
+   if (states == null) throw new ArgumentNullException("states");
+   bool any = false;
+   foreach (var pair in states) { var t = FindTodo(pair.Key); if (t != null && t.done != pair.Value) { any = true; break; } }
+   if (!any) return;
+   string stamp = Stamp();
+   Edit(DeskChange.Todos, d => {
+    foreach (var pair in states) {
+     var t = d.todos.Find(v => v.id == pair.Key);
+     if (t == null || t.done == pair.Value) continue;
+     t.done = pair.Value;
+     t.completed = pair.Value ? stamp : "";
+    }
+   });
+  }
+
+  /// Moves a reminder to another day ("" or null = no date).
+  public void SetTodoDue(string todoId, string dueDateKey) {
+   string due = TodoDue(dueDateKey);
+   Edit(DeskChange.Todos, d => { TodoIn(d, todoId).due = due; });
+  }
+
+  public void DeleteTodo(string todoId) { Edit(DeskChange.Todos, d => d.todos.RemoveAll(v => v.id == todoId)); }
 
   // ---- Side effects --------------------------------------------------------------------
 
@@ -309,11 +391,47 @@ namespace MacDesk.Core {
    EntryServices.Open(item);
   }
 
+  /// Starts an app entry with ShellExecute. Safe on a worker thread (resolving a shortcut or
+  /// an elevation prompt can take a while); pass a copy of the item read on the UI thread.
+  public static void OpenAppOnWorker(DeskItem item) {
+   if (item == null) throw new ArgumentNullException("item");
+   EntryServices.OpenDesktopApp(item);
+  }
+
+  /// Context-menu actions on an entry: terminal / editor at its folder, or reveal in Explorer.
+  public void OpenWith(string groupId, string itemId, EntryAction action) {
+   var item = FindItem(groupId, itemId);
+   if (item == null) throw new InvalidDataException("条目已删除。");
+   switch (action) {
+    case EntryAction.Terminal: EntryServices.OpenInTerminal(item); break;
+    case EntryAction.VSCode: EntryServices.OpenInCodeEditor(item, "vscode"); break;
+    case EntryAction.Cursor: EntryServices.OpenInCodeEditor(item, "cursor"); break;
+    default: EntryServices.OpenContainingFolder(item); break;
+   }
+  }
+
+  /// Whether the editor behind EntryAction.VSCode / EntryAction.Cursor is installed.
+  public static bool HasEditor(EntryAction editor) {
+   if (editor == EntryAction.VSCode) return EntryServices.FindEditorExecutable("vscode") != null;
+   if (editor == EntryAction.Cursor) return EntryServices.FindEditorExecutable("cursor") != null;
+   return false;
+  }
+
+  /// Opens the user's desktop folder or MacDesk's backup folder in Explorer.
+  public void OpenFolder(DataFolder folder) {
+   string directory = folder == DataFolder.Backups ? Path.Combine(Root, "Backups") : Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+   Directory.CreateDirectory(directory);
+   EntryServices.Open(new DeskItem { type = "folder", target = directory });
+  }
+
   /// Installed apps from the Start menu / desktop (cached ~45 s). Items have fresh ids and are
-  /// not part of any folder until passed to ToggleCandidate.
+  /// not part of any folder until passed to ToggleCandidate. Safe on a worker thread.
   public List<DeskItem> DiscoverApps() { return EntryServices.DiscoverSystemApps(); }
 
-  /// 128 px icon for an entry (cached; never null).
+  /// 128 px icon for an entry (cached; never null). Safe on a worker thread.
   public Image GetIcon(DeskItem item) { return IconProvider.Get(item); }
+
+  /// A new, uncached icon image that the caller owns and disposes. Safe on a worker thread.
+  public static Image LoadIcon(DeskItem item) { return IconProvider.Load(item); }
  }
 }

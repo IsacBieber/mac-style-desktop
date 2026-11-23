@@ -33,7 +33,7 @@ namespace MacDeskNative {
   bool rendering, draggingCard;
   Point mouseClient = new Point(-999, -999);
   Point dragDownScreen, dragOrigLoc, dragTargetLocation;
-  enum CalendarTarget { None, PreviousMonth, NextMonth, Today, Day }
+  enum CalendarTarget { None, PreviousMonth, NextMonth, Today, Day, Widget }
   int monthOffset, hoveredDay = -1;
   CalendarTarget pressedTarget;
   readonly Spring monthHover = new Spring(0, 0.2, 1.0);
@@ -42,10 +42,13 @@ namespace MacDeskNative {
   readonly Spring navPress = new Spring(1, 0.22, 0.55);
   int dayHoverTarget = -1;
   long renderedMinute = -1;
-  Rectangle MonthCard, GridRegion, FooterRegion;
+  Rectangle MonthCard, GridRegion, FooterRegion, TodoCard;
   DateTime calendarMonth;
   DesktopData calendarData;
   readonly string[] monthNotes = new string[32];
+  readonly int[] monthTodos = new int[32];
+  readonly TodoWidget todos;
+  const int TodoGap = 14;
   bool gridDirty = true;
 
   public bool DesktopChildMode { get; private set; }
@@ -59,6 +62,7 @@ namespace MacDeskNative {
    DesktopChildMode = NativeDesktopHost.Parent != IntPtr.Zero;
    if (DesktopChildMode) TopLevel = false;
    app = controller;
+   todos = new TodoWidget(controller);
    AutoScaleMode = AutoScaleMode.None;
    FormBorderStyle = FormBorderStyle.None;
    ShowInTaskbar = true;
@@ -70,7 +74,7 @@ namespace MacDeskNative {
    UpdateCalendarLayout(DisplayedMonth(BeijingFromUtc(DateTime.UtcNow)));
    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint, true);
    AccessibleName = "桌面小组件：北京时间和月历";
-   AccessibleDescription = "点击日期写备忘，滚轮切换月份。";
+   AccessibleDescription = "点击日期查看当天的提醒事项和备注，滚轮切换月份；下方是提醒事项小组件。";
    pump = new FramePump(this, Tick);
    Wallpaper.Changed += OnWallpaperChanged;
 
@@ -78,6 +82,9 @@ namespace MacDeskNative {
    PanelDrawing.StyleMenu(menu);
    menu.Items.Add("新建桌面文件夹", null, delegate {
     BeginInvoke((Action)delegate { if (!IsDisposed) app.CreateAndOpenNewGroup(PointToScreen(new Point(480, 120))); });
+   });
+   menu.Items.Add("新建提醒事项", null, delegate {
+    BeginInvoke((Action)delegate { if (!IsDisposed) app.ShowAgenda(RectangleToScreen(TodoCard), RectangleToScreen(TodoCard), true); });
    });
    menu.Items.Add("回到本月", null, delegate { ChangeMonth(-monthOffset); });
    menu.Items.Add(new ToolStripSeparator());
@@ -87,10 +94,12 @@ namespace MacDeskNative {
    timer.Interval = 1000;
    timer.Tick += delegate {
     EnsureZOrder();
+    if (todos.DayChanged) { todos.Refresh(false); gridDirty = true; }
     if (DateTime.UtcNow.Ticks / TimeSpan.TicksPerMinute != renderedMinute) Render();
     else Wallpaper.RefreshIfNeeded();
    };
    timer.Start();
+   todos.Refresh(false);
    RefreshData();
   }
 
@@ -136,7 +145,16 @@ namespace MacDeskNative {
    base.CreateHandle();
   }
 
-  bool HitsCard(Point pt) { return ClockCard.Contains(pt) || MonthCard.Contains(pt); }
+  bool HitsCard(Point pt) { return ClockCard.Contains(pt) || MonthCard.Contains(pt) || TodoCard.Contains(pt); }
+
+  /// Presses on the calendar or the reminders widget drive the day card themselves, so the
+  /// card must not treat them as "outside".
+  internal bool OwnsSheetPress(Point screen) {
+   if (!IsHandleCreated) return false;
+   Point p = PointToClient(screen);
+   return MonthCard.Contains(p) || TodoCard.Contains(p);
+  }
+  internal TodoWidget ReminderWidget { get { return todos; } }
 
   protected override void WndProc(ref Message m) {
    if (m.Msg == 0x7B && ContextMenuStrip != null) {
@@ -157,7 +175,9 @@ namespace MacDeskNative {
 
   public void RefreshData() {
    if (IsDisposed || Disposing) return;
+   todos.Refresh(IsHandleCreated && Visible);
    Render();
+   Wake();
   }
 
   void ChangeMonth(int delta) {
@@ -193,9 +213,20 @@ namespace MacDeskNative {
     if (k++ % 60 == 0) ChangeMonth(1);
     Tick(1 / 240.0);
    });
+   todos.Refresh(false);
+   k = 0;
+   var widget = MacDeskNative.Bench.Time("reminders widget hover", 240, delegate {
+    RectangleF r = todos.RowRect((k++ / 12) % Math.Max(1, todos.VisibleRows));
+    var at = Point.Round(new PointF(r.X + 150, r.Y + r.Height / 2));
+    todos.MouseMove(at);
+    mouseClient = at;
+    Tick(1 / 240.0);
+   });
+   todos.MouseLeave();
+   if (dir != null) { Render(); surface.SaveSnapshot(System.IO.Path.Combine(dir, "home-widgets.png")); }
    var drag = BenchDrag();
    pump.Stop();
-   return new[] { hover, flip, drag };
+   return new[] { hover, flip, widget, drag };
   }
 
   private Bench.Stat BenchDrag() {
@@ -233,6 +264,7 @@ namespace MacDeskNative {
    active |= monthSlide.Step(dt);
    active |= dayHover.Step(dt);
    active |= navPress.Step(dt);
+   active |= todos.Step(dt);
    Render();
    return active;
   }
@@ -241,7 +273,7 @@ namespace MacDeskNative {
    Backdrop bd = Wallpaper.Current;
    if (bd == null) return null;
    Point origin = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
-   Rectangle region = Rectangle.Inflate(Rectangle.Union(ClockCard, MonthCard), 4, 4);
+   Rectangle region = Rectangle.Inflate(Rectangle.Union(ClockCard, TodoCard), 4, 4);
    region.Offset(origin);
    region.Intersect(bd.Area);
    if (region.Width <= 0 || region.Height <= 0) return null;
@@ -303,6 +335,7 @@ namespace MacDeskNative {
   void DrawStaticCards(Graphics g) {
    DrawCard(g, ClockCard);
    DrawCard(g, MonthCard);
+   DrawCard(g, TodoCard);
    using (var f = Ui.Centered(false))
     for (int c = 0; c < 7; c++)
      using (var b = new SolidBrush(c == 0 || c == 6 ? Ui.TertiaryLabel : Ui.SecondaryLabel))
@@ -338,6 +371,7 @@ namespace MacDeskNative {
     DrawCards(g);
     DrawClock(g, now, minute != renderedMinute);
     DrawCalendar(g, now.Date, month);
+    todos.Draw(g);
     surface.Present(Handle, DesktopChildMode ? (Point?)null : Location, 255, null);
     renderedMinute = minute;
    } finally { rendering = false; }
@@ -385,25 +419,43 @@ namespace MacDeskNative {
    bool hasNotes = false;
    int days = DateTime.DaysInMonth(month.Year, month.Month);
    bool lookupNotes = calendarData.notes != null && calendarData.notes.Count > 0;
+   var counts = new int[32];
+   if (calendarData.todos != null) {
+    string prefix = month.ToString("yyyy-MM-", System.Globalization.CultureInfo.InvariantCulture);
+    foreach (var t in calendarData.todos) {
+     int d;
+     if (!t.done && t.due != null && t.due.Length == 10 && t.due.StartsWith(prefix, StringComparison.Ordinal) && int.TryParse(t.due.Substring(8), out d) && d >= 1 && d <= 31) counts[d]++;
+    }
+   }
    for (int day = 1; day <= days; day++) {
     string note = null;
     if (lookupNotes) calendarData.notes.TryGetValue(month.AddDays(day - 1).ToString("yyyy-MM-dd"), out note);
     if (String.IsNullOrEmpty(note)) note = null;
-    gridDirty |= (monthNotes[day] != null) != (note != null);
+    bool marked = note != null || counts[day] > 0;
+    gridDirty |= (monthNotes[day] != null || monthTodos[day] > 0) != marked;
     monthNotes[day] = note;
-    hasNotes |= note != null;
+    monthTodos[day] = counts[day];
+    hasNotes |= marked;
    }
    Array.Clear(monthNotes, days + 1, monthNotes.Length - days - 1);
+   Array.Clear(monthTodos, days + 1, monthTodos.Length - days - 1);
    int gridHeight = CalendarRows(month) * CellH;
    MonthCard = CalendarCardBounds(month, hasNotes);
    GridRegion = new Rectangle(GridLeft - 4, GridTop - 4, CellW * 7 + 8, gridHeight + 6);
    FooterRegion = new Rectangle(20, GridTop + gridHeight + 1, 312, NoteHeight);
-   int height = MonthCard.Bottom + 12;
+   TodoCard = TodoCardBounds(MonthCard);
+   todos.Bounds = TodoCard;
+   int height = TodoCard.Bottom + 12;
    if (Size != new Size(WidgetWidth, height)) {
     bool grew = height > Height;
     Size = new Size(WidgetWidth, height);
     if (grew && Visible) FitCalendarOnScreen();
    }
+  }
+
+  /// The reminders widget: fixed size, right under the calendar.
+  internal static Rectangle TodoCardBounds(Rectangle monthCard) {
+   return new Rectangle(monthCard.X, monthCard.Bottom + TodoGap, TodoWidget.CardWidth, TodoWidget.CardHeight);
   }
 
   void FitCalendarOnScreen() {
@@ -460,7 +512,7 @@ namespace MacDeskNative {
     if (monthOffset != 0) {
      bool over = TodayButton.Contains(mouseClient);
      using (var path = Ui.Squircle(TodayButton, TodayButton.Height / 2f))
-     using (var b = new SolidBrush(Color.FromArgb(over ? 70 : 44, 255, 255, 255))) g.FillPath(b, path);
+     using (var b = new SolidBrush(over ? Theme.ControlFillHover : Theme.ControlFill)) g.FillPath(b, path);
      using (var f = Ui.Centered(false)) TextStyle.Draw(g, "今天", Ui.Cjk, FontStyle.Bold, 12.5f, Ui.Red, TodayButton, f, 0f);
     }
    }
@@ -478,7 +530,7 @@ namespace MacDeskNative {
       if (isToday) using (var b = new SolidBrush(Ui.Red)) cg.FillEllipse(b, circle);
       Color ink = isToday ? Color.White : (col == 0 || col == 6 ? Ui.SecondaryLabel : Ui.Label);
       TextStyle.Draw(cg, d.ToString(), isToday ? Ui.TextSemibold : Ui.TextRegular, FontStyle.Regular, 15.5f, ink, new RectangleF(circle.X - 4, circle.Y, circle.Width + 8, circle.Height), f, isToday ? 0f : 0.35f);
-      if (monthNotes[d] != null)
+      if (monthNotes[d] != null || monthTodos[d] > 0)
        using (var b = new SolidBrush(isToday ? Ui.Red : Ui.Orange)) cg.FillEllipse(b, circle.X + 15 - 2.5f, circle.Y + CellH - 5.5f, 5, 5);
      }
     }
@@ -501,8 +553,8 @@ namespace MacDeskNative {
    g.Clip = oldClip;
    oldClip.Dispose();
 
-   string activeNote = hoveredDay > 0 && hoveredDay <= days ? monthNotes[hoveredDay] : null;
-   string todayNote = month.Year == today.Year && month.Month == today.Month ? monthNotes[today.Day] : null;
+   string activeNote = hoveredDay > 0 && hoveredDay <= days ? DaySummary(hoveredDay) : null;
+   string todayNote = month.Year == today.Year && month.Month == today.Month ? DaySummary(today.Day) : null;
    string footer = activeNote != null ? hoveredDay + "日 · " + activeNote : todayNote != null ? "今天 · " + todayNote : "";
    if (!String.IsNullOrEmpty(footer)) {
     if (footerCache == null || footerKey != footer) {
@@ -515,11 +567,20 @@ namespace MacDeskNative {
    }
   }
 
+  // "2 项待办 · 下午三点评审", or null when the day has neither.
+  string DaySummary(int day) {
+   string note = monthNotes[day];
+   int count = monthTodos[day];
+   if (count == 0) return note;
+   string todo = count + " 项待办";
+   return note == null ? todo : todo + " · " + note;
+  }
+
   void DrawChevron(Graphics g, Rectangle r, string glyph, float alpha, float scale) {
    bool over = r.Contains(mouseClient);
    var rr = Scale(r, scale);
    using (var path = Ui.Squircle(rr, rr.Height / 2f))
-   using (var b = new SolidBrush(Color.FromArgb((int)((over ? 64 : 34) * alpha), 255, 255, 255))) g.FillPath(b, path);
+   using (var b = new SolidBrush(Ui.WithAlpha(over ? Theme.ControlFillHover : Theme.ControlFill, alpha))) g.FillPath(b, path);
    using (var f = Ui.Centered(false)) using (var b = new SolidBrush(Ui.WithAlpha(Ui.Red, alpha))) g.DrawString(glyph, chevronFont, b, new RectangleF(rr.X, rr.Y - 2, rr.Width, rr.Height), f);
   }
 
@@ -532,6 +593,7 @@ namespace MacDeskNative {
 
   CalendarTarget TargetAt(Point pt, out int day) {
    day = -1;
+   if (TodoCard.Contains(pt)) return todos.IsInteractive(pt) ? CalendarTarget.Widget : CalendarTarget.None;
    if (!MonthCard.Contains(pt)) return CalendarTarget.None;
    DateTime month = DisplayedMonth(BeijingFromUtc(DateTime.UtcNow).Date);
    day = HitCalendarDay(pt, month);
@@ -547,6 +609,7 @@ namespace MacDeskNative {
    if (e.Button != MouseButtons.Left) return;
    int day;
    pressedTarget = TargetAt(e.Location, out day);
+   if (pressedTarget == CalendarTarget.Widget) todos.MouseDown(e.Location);
    if (pressedTarget == CalendarTarget.None && HitsCard(e.Location)) {
     draggingCard = true;
     dragDownScreen = PointToScreen(e.Location);
@@ -568,7 +631,7 @@ namespace MacDeskNative {
    mouseClient = e.Location;
    int day;
    CalendarTarget target = TargetAt(e.Location, out day);
-   bool changed = hoveredDay != day || MonthCard.Contains(previous) != MonthCard.Contains(mouseClient) ||
+   bool changed = todos.MouseMove(e.Location) || hoveredDay != day || MonthCard.Contains(previous) != MonthCard.Contains(mouseClient) ||
     PrevMonth.Contains(previous) != PrevMonth.Contains(mouseClient) || NextMonth.Contains(previous) != NextMonth.Contains(mouseClient) ||
     TodayButton.Contains(previous) != TodayButton.Contains(mouseClient);
    hoveredDay = day;
@@ -608,6 +671,7 @@ namespace MacDeskNative {
    mouseClient = new Point(-999, -999);
    hoveredDay = -1;
    pressedTarget = CalendarTarget.None;
+   todos.MouseLeave();
    Cursor = Cursors.Default;
    Wake();
   }
@@ -635,11 +699,19 @@ namespace MacDeskNative {
    if (target == CalendarTarget.PreviousMonth) { ChangeMonth(-1); return; }
    if (target == CalendarTarget.NextMonth) { ChangeMonth(1); return; }
    if (target == CalendarTarget.Today) { ChangeMonth(-monthOffset); return; }
+   if (target == CalendarTarget.Widget) {
+    Point at = e.Location;
+    BeginInvoke((Action)delegate { if (!IsDisposed && todos.Click(at, r => RectangleToScreen(r))) Wake(); });
+    return;
+   }
    if (target == CalendarTarget.Day) {
     DateTime month = DisplayedMonth(BeijingFromUtc(DateTime.UtcNow).Date);
-    string dateKey = new DateTime(month.Year, month.Month, day).ToString("yyyy-MM-dd");
-    Point screenPos = PointToScreen(new Point(MonthCard.Left, MonthCard.Bottom - 80));
-    BeginInvoke((Action)delegate { if (!IsDisposed) app.EditCalendarNote(dateKey, screenPos); });
+    string dateKey = Reminders.Key(new DateTime(month.Year, month.Month, day));
+    Rectangle beside = RectangleToScreen(MonthCard);
+    RectangleF circle = DayCircle(month, day);
+    Point corner = PointToScreen(Point.Round(circle.Location));
+    var dayScreen = new RectangleF(corner.X, corner.Y, circle.Width, circle.Height);
+    BeginInvoke((Action)delegate { if (!IsDisposed) app.ShowDay(dateKey, beside, dayScreen); });
    }
   }
 
@@ -653,6 +725,7 @@ namespace MacDeskNative {
     surface.Dispose();
     if (wallpaperBrush != null) { wallpaperBrush.Dispose(); wallpaperBrush = null; }
     chevronFont.Dispose();
+    todos.Dispose();
     blitAttributes.Dispose();
     foreach (var c in new[] { cardsCache, clockCache, headerCache, gridCache, footerCache }) if (c != null) c.Dispose();
     if (ContextMenuStrip != null) ContextMenuStrip.Dispose();

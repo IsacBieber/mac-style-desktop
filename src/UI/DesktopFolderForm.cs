@@ -958,7 +958,10 @@ namespace MacDeskNative {
     RectangleF icon = IconRect(tile);
     app.OpenGroup(id, PointToScreen(new Point((int)(icon.X + icon.Width / 2), (int)(VisualBounds(tile).Y + IconTop + IconSize / 2))));
    });
-   AddMenu(menu, "重命名…", delegate { app.EditGroup(id); });
+   AddMenu(menu, "重命名", delegate {
+    RectangleF icon = IconRect(tile);
+    app.RenameGroupFromDesktop(id, PointToScreen(new Point((int)(icon.X + icon.Width / 2), (int)(VisualBounds(tile).Y + IconTop + IconSize / 2))));
+   });
    AddMenu(menu, "新建文件夹", delegate {
     Rectangle r = VisibleBounds(tile);
     app.CreateAndOpenNewGroup(PointToScreen(new Point(r.Left + r.Width / 2, r.Top + IconTop + IconSize / 2)));
@@ -967,7 +970,7 @@ namespace MacDeskNative {
    AddMenu(menu, "前移", delegate { app.TryMoveGroup(id, Math.Max(0, index - 1)); });
    AddMenu(menu, "后移", delegate { app.TryMoveGroup(id, index + 2); });
    menu.Items.Add(new ToolStripSeparator());
-   menu.Items.Add("删除文件夹（不删除原文件）…", null, delegate { Defer(delegate { app.DeleteGroup(id); }); }).Tag = PanelDrawing.Destructive;
+   menu.Items.Add("移除文件夹", null, delegate { Defer(delegate { app.DeleteGroup(id); }); }).Tag = PanelDrawing.Destructive;
    AddMenu(menu, "退出 MacDesk", delegate { app.Quit(); });
    menu.Closed += delegate { Defer(delegate { menus.Remove(menu); menu.Dispose(); }); };
    try { app.ShowDesktopMenu(menu, PointToScreen(point)); } catch { menus.Remove(menu); menu.Dispose(); throw; }

@@ -32,13 +32,13 @@ namespace MacDeskNative {
    return new Font("Segoe UI", px, style, GraphicsUnit.Pixel);
   }
 
-  // Apple system colors (dark appearance).
-  internal static readonly Color Red = Color.FromArgb(255, 69, 58);
-  internal static readonly Color Blue = Color.FromArgb(10, 132, 255);
-  internal static readonly Color Orange = Color.FromArgb(255, 159, 10);
-  internal static readonly Color Label = Color.FromArgb(255, 255, 255);
-  internal static readonly Color SecondaryLabel = Color.FromArgb(190, 235, 235, 245);
-  internal static readonly Color TertiaryLabel = Color.FromArgb(120, 235, 235, 245);
+  // Apple system colors (dark appearance) - aliases of the tokens in Theme.
+  internal static readonly Color Red = Theme.Red;
+  internal static readonly Color Blue = Theme.Blue;
+  internal static readonly Color Orange = Theme.Orange;
+  internal static readonly Color Label = Theme.Label;
+  internal static readonly Color SecondaryLabel = Theme.SecondaryLabel;
+  internal static readonly Color TertiaryLabel = Theme.TertiaryLabel;
 
    internal const float SquircleControlRatio = 0.348f / 1.3f;
    internal static float SquircleCorner(RectangleF r, float radius) {

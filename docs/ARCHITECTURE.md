@@ -2,15 +2,34 @@
 
 ## 0. 分层
 
-- `src/Core`：后端（数据、存储、启动、应用发现、图标）。唯一入口是 `DeskService`，契约见 [BACKEND_API.md](BACKEND_API.md)。构建时会单独编译以确保它不依赖 UI。
-- `src/UI`：前端（下面各节描述的窗口、材质、动画）。只通过 `AppController.Service`（`DeskService`）读写数据，订阅它的 `Changed` 刷新。
+- `src/Core`：后端（数据、存储、启动、应用发现、图标、提醒事项查询）。唯一入口是 `DeskService`，契约见 [BACKEND_API.md](BACKEND_API.md)。构建时会单独编译以确保它不依赖 UI。
+- `src/UI`：前端（下面各节描述的窗口、材质、动画）。只通过 `AppController.Service`（`DeskService`）读写数据，订阅它的 `Changed` 刷新；构建会扫描 `src/UI`，直接调用后端内部类（`EntryServices`、`IconProvider`、`DesktopStore`）就失败。
+  - `Theme.cs`：唯一的一套视觉令牌（颜色、圆角、字号、弹层弹簧参数）。
+  - `Controls/`：自绘输入框 `TextField`、文字位图缓存 `TextSprites`、新版文件夹选择器 `FolderPicker`。
+  - `Sheets/`：不激活的毛玻璃弹层：基类 `GlassPopup`，日程卡片 `DaySheet`，确认框 `AlertSheet`，提示条 `Toast`。
+  - `Widgets/`：提醒事项小组件 `TodoWidget`（由 `HomeForm` 承载）和共用的 `Reminders` 绘制 / 日期工具。
 - `src/Host`：`Program.cs`（入口、`--self-test`、`--bench`、桌面层级维护）与 `NativeDesktopHost.cs`（挂到 Explorer 桌面视图）。
+
+### 架构评估（2026-11-23）
+
+做得好的：前后端边界由构建双向保证；`DeskService` 是唯一入口；存储是「克隆 → 校验 → 哈希比对 → 原子替换」，失败回滚；动画是「一个时钟、一套几何」；后端测试覆盖了每个写操作。
+
+这次收口的问题：
+
+1. 前端绕过 `DeskService` 直接用后端工具类（启动应用有两条路径）→ 补齐 `DeskService` 的入口，并在构建里检查。
+2. 后端残留界面已不用的像素坐标接口 → 已删除。
+3. `Changed` 不区分改动 → 带上变更种类，各视图只刷新自己显示的数据。
+4. 备份只增不减 → 加上保留策略。
+5. 前端缺少可复用的输入框和弹层，颜色散落各处，导致新功能只能用旧 WinForms 对话框 → 抽出 `Theme`、`TextField`、`GlassPopup`，旧对话框只剩「编辑入口」表单（已按同一套令牌重画）。
+
+仍然存在、但暂不处理的：`FolderLayer.cs`（约 2300 行）同时负责渲染、输入、拖放、菜单；`AppController` 兼管生命周期、弹层、数据包装和托盘。新增功能已放在独立文件里，后续可按同样方式继续拆分。`DeskService.Data` 仍是可变对象，「只读」靠约定。
 
 ## 1. 窗口拓扑
 
 - `HomeForm`：左侧时钟 / 日历小组件，**不**作为独立顶层窗口，而是挂在桌面 `SHELLDLL_DefView` 下的 `WS_CHILD`，并保持在 `SysListView32` 之前。
 - `DesktopFolderForm`：桌面文件夹画布，同样是 `SHELLDLL_DefView` 的子窗口。它还负责在文件夹打开期间接管键盘焦点（见第 4 节）。
 - `BackdropOverlay`（`src/UI/Folder`）：覆盖工作区，呈现模糊压暗的背景。截图就绪后只更新整体透明度。`WS_EX_NOACTIVATE`，点击会关闭文件夹。
+- `GlassPopup` 系列（`src/UI/Sheets`）：日程卡片、确认框、提示条。和 `FolderLayer` 一样是 `WS_EX_NOACTIVATE` 的 layered 顶层窗口，owner 为程序内部隐藏窗口。
 - `FolderLayer`（`src/UI/Folder`）由所有文件夹复用。开合时窗口跟随当前帧的绘制范围，绘图缓冲按面板尺寸预留。从展开第一帧到收起最后一帧，它负责绘制和处理输入。窗口使用 `WS_EX_NOACTIVATE`，owner 为程序内部隐藏窗口。
 
 不写 Shell 的 Z 序、不设置全局 topmost、不安装任何全局钩子。
@@ -51,6 +70,16 @@ MacDesk 窗口成功挂载后，临时隐藏原生桌面图标列表 `SysListVie
 键盘输入改由 `DesktopFolderForm` 接收：它是桌面视图的子窗口，与 Explorer 桌面线程共享输入队列，可以在桌面保持激活的同时拿到焦点。打开文件夹时 `TakeKeyboardFocus`，关闭时把焦点还给原来的桌面控件。按键经 `AppController.RouteKey / RouteChar` 转给面板；重命名在面板内自绘输入框，并用 `ImmSetCompositionWindow / ImmSetCandidateWindow` 把输入法窗口放到输入位置。
 
 若其他程序成为前台（`GetForegroundWindow` 不是桌面也不是本进程），面板自动收起，不会留下一层压暗背景。
+
+**键盘目标栈**：弹层（日程卡片、确认框）打开时压入 `AppController` 的目标栈（`IKeyTarget`），`RouteKey / RouteChar` 先交给栈顶，栈空时才交给文件夹面板。确认框盖在面板上时，面板暂停「点外部关闭」，点在任何弹层上的鼠标也不算外部。外部点击统一由 `OutsideClickWatcher` 轮询鼠标按键得到（菜单、面板、弹层共用）。
+
+新的需要文字输入的界面必须继承 `GlassPopup`（或在面板内自绘），用 `TextField` 处理按键，绝不能弹出会获得焦点的窗口。唯一的例外是「编辑入口」表单：它需要原生文本框编辑长路径，打开时会激活，这是已接受的。
+
+## 4.1 弹层（GlassPopup）
+
+- 打开前截取卡片将要覆盖（及可能扩展到）的屏幕区域并模糊，作为毛玻璃；外圈留 18px 画柔和阴影。
+- 进度弹簧（打开 0.32s / 阻尼 0.86，关闭 0.20s / 1.0）控制缩放和透明度，缩放原点是卡片边上离锚点（被点的日期、小组件的行）最近的点。内容只在变化时重画成位图；动画帧只做一次缩放复制，透明度由 layered 窗口的整体 alpha 完成；落定后按整数像素 1:1 复制。
+- 勾选提醒事项时动画立即开始，保存推迟约 0.5 秒并合并成一次写盘（写盘中的 fsync 不会打断动画）；视图在此期间用 `AppController.IsTodoDone` 显示待保存的状态。
 
 从面板启动应用时，后台线程把原快捷方式交给本会话的 Windows Shell。Shell 接受启动请求后直接收起面板。普通关闭继续播放收起动画。
 

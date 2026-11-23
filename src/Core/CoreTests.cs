@@ -60,25 +60,22 @@ namespace MacDesk.Core {
    try { svc.UpdateItem("two", first, new DeskItem { id = first, title = "stale" }, edited); } catch (InvalidDataException) { threw = true; }
    Check(threw, "stale update rejected");
 
-   svc.SetGroupPosition("two", 500, 300, null, new Size(1920, 1080));
-   Check(svc.GetGroup("two").desktopX == 500 && svc.GetGroup("two").desktopY == 300, "pin folder position");
-   svc.ResetGroupPositions();
-   Check(svc.GetGroup("two").desktopX == -1, "reset positions");
-   // Pinned layout -> order. List is [two, one]; pin "one" left of "two" on the same row.
-   svc.SetGroupPosition("one", 300, 30, null, new Size(1920, 1080));
-   svc.SetGroupPosition("two", 700, 24, null, new Size(1920, 1080));
+   // Pinned layout written by an older version -> order. List is [two, one]; "one" sits left of "two" on the same row.
+   new DesktopStore(root).Edit(d => {
+    var a = d.groups.Find(g => g.id == "one"); a.desktopX = 300; a.desktopY = 30;
+    var b = d.groups.Find(g => g.id == "two"); b.desktopX = 700; b.desktopY = 24;
+   });
+   svc.Reload();
    Check(svc.MigratePinnedPositionsToOrder() && svc.Data.groups[0].id == "one" && svc.Data.groups[1].id == "two" && svc.Data.groups[0].desktopX == -1, "pinned positions migrate to reading order");
    Check(!svc.MigratePinnedPositionsToOrder(), "migration runs once");
    svc.MoveGroup("two", 0); // restore [two, one] for the checks below
-   int before = changes;
-   var batch = new System.Collections.Generic.Dictionary<string, Point> { { "one", new Point(700, 24) }, { "two", new Point(832, 24) } };
-   svc.SetGroupPositions(batch, null, new Size(1920, 1080));
-   Check(changes == before + 1 && svc.GetGroup("one").desktopX == 700 && svc.GetGroup("two").desktopX == 832, "batch positions save atomically");
-   svc.ResetGroupPositions();
+
+   CheckTodos(svc);
 
    var fresh = new DesktopStore(root);
    Check(fresh.Data.groups[0].items[0].id == first, "restart persistence");
    Check(fresh.Data.notes["2026-11-22"] == "里程碑检查" && fresh.Data.showLabels, "notes and labels persistence");
+   Check(fresh.Data.version == DesktopData.CurrentVersion && fresh.Data.todos.Count == 4, "reminders persistence");
    Check(File.ReadAllText(file) == "UNCHANGED", "never touches source files");
    var old = fresh.Data.groups[0].title;
    try { fresh.Edit(d => { d.groups[0].title = ""; }); throw new Exception("Invalid title accepted"); } catch (InvalidDataException) { }
@@ -100,6 +97,101 @@ namespace MacDesk.Core {
    Check(seeded.SeedStarterGroupsIfNew() && seeded.Data.groups.Count == 4 && File.Exists(Path.Combine(seedRoot, "desktop.json")), "seed starter folders");
    Check(!seeded.SeedStarterGroupsIfNew(), "seed only once");
    CheckShortcutTypes(Path.Combine(root, "shortcut-types"));
+   CheckVersionMigration(Path.Combine(root, "v1"));
+   CheckBackupRetention(Path.Combine(root, "prune"));
+  }
+
+  static void CheckTodos(DeskService svc) {
+   DeskChange last = DeskChange.None;
+   int saves = 0;
+   svc.Changed += delegate(object s, EventArgs e) { last = DeskChangedEventArgs.KindsOf(e); saves++; };
+   svc.RenameGroup("one", "核心开发");
+   Check(last == DeskChange.Groups, "folder edits report Groups");
+   svc.SetNote("2026-11-24", "评审");
+   Check(last == DeskChange.Notes, "note edits report Notes");
+   int before = saves;
+   svc.SetNote("2026-11-24", " 评审 ");
+   Check(saves == before, "unchanged note is not saved again");
+   svc.SetNote("2026-11-24", "");
+   svc.ToggleShowLabels(); svc.ToggleShowLabels();
+   Check(last == DeskChange.Prefs, "preference edits report Prefs");
+
+   var t1 = svc.AddTodo("  写周报 ", "2026-11-20");
+   Check(t1.title == "写周报" && last == DeskChange.Todos && t1.created.Length > 0, "add reminder trims, stamps and reports Todos");
+   var t2 = svc.AddTodo("发布检查", "2026-11-23");
+   var t3 = svc.AddTodo("买咖啡豆", "");
+   var t4 = svc.AddTodo("更早的逾期", "2026-11-18");
+   var agenda = TodoQueries.Agenda(svc.Data, "2026-11-23");
+   Check(agenda.Count == 4 && agenda[0].Todo.id == t4.id && agenda[1].Todo.id == t1.id && agenda[0].Section == TodoQueries.AgendaSection.Overdue &&
+    agenda[2].Todo.id == t2.id && agenda[2].Section == TodoQueries.AgendaSection.Today &&
+    agenda[3].Todo.id == t3.id && agenda[3].Section == TodoQueries.AgendaSection.Undated, "agenda: overdue oldest first, then today, then undated");
+
+   svc.SetTodoDone(t2.id, true);
+   Check(svc.FindTodo(t2.id).done && svc.FindTodo(t2.id).completed.Length > 0, "completing a reminder stamps it");
+   before = saves;
+   svc.SetTodoDone(t2.id, true);
+   Check(saves == before, "completing twice does not save again");
+   Check(TodoQueries.Agenda(svc.Data, "2026-11-23").Count == 3, "completed reminders leave the agenda");
+   var t5 = svc.AddTodo("同日第二项", "2026-11-23");
+   var day = TodoQueries.ForDay(svc.Data, "2026-11-23");
+   Check(day.Count == 2 && day[0].id == t5.id && day[1].id == t2.id, "day list puts completed reminders last");
+   svc.SetTodoDone(t2.id, false);
+   Check(!svc.FindTodo(t2.id).done && svc.FindTodo(t2.id).completed == "", "reopening clears the stamp");
+
+   before = saves;
+   svc.SetTodosDone(new System.Collections.Generic.Dictionary<string, bool> { { t1.id, true }, { t5.id, true }, { "gone", true } });
+   Check(saves == before + 1 && svc.FindTodo(t1.id).done && svc.FindTodo(t5.id).done, "batched ticks save once and skip deleted reminders");
+   svc.SetTodosDone(new System.Collections.Generic.Dictionary<string, bool> { { t1.id, false }, { t5.id, false } });
+
+   svc.RenameTodo(t3.id, "买豆子");
+   svc.SetTodoDue(t3.id, "2026-11-25");
+   Check(svc.FindTodo(t3.id).title == "买豆子" && svc.FindTodo(t3.id).due == "2026-11-25", "rename and reschedule");
+   var marks = TodoQueries.DayMarkers(svc.Data, 2026, 11);
+   Check((marks[25] & TodoQueries.DayMark.OpenTodos) != 0 && (marks[22] & TodoQueries.DayMark.Note) != 0 &&
+    marks[24] == TodoQueries.DayMark.None && (marks[20] & TodoQueries.DayMark.OpenTodos) != 0, "calendar day markers");
+   svc.SetTodoDue(t3.id, "");
+   Check(svc.FindTodo(t3.id).due == "", "remove a reminder's date");
+
+   var snapshot = svc.Data;
+   foreach (var bad in new[] { new[] { "   ", "" }, new[] { "x", "2026-02-30" }, new[] { "x", "11/23" }, new[] { new string('长', DesktopStore.MaxTodoTitle + 1), "" } }) {
+    bool rejected = false;
+    try { svc.AddTodo(bad[0], bad[1]); } catch (InvalidDataException) { rejected = true; }
+    Check(rejected && svc.Data == snapshot, "invalid reminder rejected without change");
+   }
+   bool missing = false;
+   try { svc.RenameTodo("missing", "x"); } catch (InvalidDataException) { missing = true; }
+   Check(missing, "editing a deleted reminder fails");
+   svc.DeleteTodo(t4.id);
+   Check(svc.FindTodo(t4.id) == null && svc.Data.todos.Count == 4, "delete reminder");
+  }
+
+  static void CheckVersionMigration(string root) {
+   Directory.CreateDirectory(root);
+   string path = Path.Combine(root, "desktop.json");
+   File.WriteAllText(path, "{\"version\":1,\"groups\":[{\"id\":\"g1\",\"title\":\"旧文件夹\",\"subtitle\":\"\",\"items\":[],\"desktopX\":-1,\"desktopY\":-1}],\"notes\":{\"2026-01-02\":\"旧备忘\"},\"showLabels\":false,\"homeX\":-1,\"homeY\":-1}", new System.Text.UTF8Encoding(false));
+   var upgraded = new DeskService(root);
+   Check(upgraded.Data.version == 2 && upgraded.Data.todos.Count == 0 && upgraded.GetNote("2026-01-02") == "旧备忘" && upgraded.Data.groups[0].title == "旧文件夹", "version 1 file loads as version 2");
+   upgraded.AddTodo("新待办", "");
+   Check(File.ReadAllText(path).Contains("\"version\":2") && new DesktopStore(root).Data.todos.Count == 1, "first save writes version 2");
+   File.WriteAllText(path, "{\"version\":3,\"groups\":[]}");
+   bool refused = false;
+   try { new DesktopStore(root); } catch (InvalidDataException) { refused = true; }
+   Check(refused, "a newer data version is refused, not rewritten");
+  }
+
+  static void CheckBackupRetention(string dir) {
+   Directory.CreateDirectory(dir);
+   var now = new DateTime(2026, 11, 23, 12, 0, 0);
+   for (int i = 0; i < 60; i++) File.WriteAllText(Path.Combine(dir, "data-20261123-" + (100000 + i) + "-0000000-x.json"), "");
+   for (int d = 1; d <= 40; d++)
+    for (int k = 0; k < 3; k++) File.WriteAllText(Path.Combine(dir, "data-" + now.AddDays(-d).ToString("yyyyMMdd") + "-12000" + k + "-0000000-x.json"), "");
+   File.WriteAllText(Path.Combine(dir, "readme.txt"), "keep");
+   DesktopStore.PruneBackups(dir, now);
+   Func<int, int, string> past = (d, k) => Path.Combine(dir, "data-" + now.AddDays(-d).ToString("yyyyMMdd") + "-12000" + k + "-0000000-x.json");
+   Check(Directory.GetFiles(dir, "data-*.json").Length == DesktopStore.KeepRecentBackups + DesktopStore.KeepDailyBackupDays - 1, "backup retention count");
+   Check(File.Exists(Path.Combine(dir, "data-20261123-100059-0000000-x.json")) && !File.Exists(Path.Combine(dir, "data-20261123-100000-0000000-x.json")) &&
+    File.Exists(past(1, 2)) && !File.Exists(past(1, 1)) && File.Exists(past(29, 2)) && !File.Exists(past(30, 2)) && File.Exists(Path.Combine(dir, "readme.txt")),
+    "backup retention keeps the newest, then one per recent day");
   }
 
   static void CheckShortcutTypes(string root) {

@@ -56,6 +56,55 @@ namespace MacDeskNative {
    return new[] { invariants, first, frames, slowest };
   }
 
+  static void SeedReminders(AppController app) {
+   string today = Reminders.TodayKey();
+   string[] titles = { "交季度报告", "回复设计稿意见", "MacDesk 发布检查", "给妈妈打电话", "买咖啡豆", "整理下载文件夹", "预约体检" };
+   for (int i = 0; i < titles.Length; i++) app.AddTodo(titles[i], i == 0 ? Reminders.AddDays(today, -1) : i == 4 ? "" : today);
+   app.SetCalendarNote(today, "下午三点评审");
+  }
+
+  // The glass popups: open/close frames and the tick animation of the day card, plus PNG
+  // snapshots (MACDESK_BENCH_FRAMES) of the day card, agenda, alert and toast.
+  static Stat[] Popups(AppController app) {
+   string dir = Environment.GetEnvironmentVariable("MACDESK_BENCH_FRAMES");
+   Rectangle work = System.Windows.Forms.Screen.PrimaryScreen.WorkingArea;
+   string today = Reminders.TodayKey();
+   var stats = new System.Collections.Generic.List<Stat>();
+   using (var sheet = new DaySheet(app)) {
+    sheet.PrepareForTest(DaySheet.SheetMode.Day, today, work);
+    if (dir != null) using (var shot = sheet.RenderSnapshot()) Save(shot, Path.Combine(dir, "day-sheet.png"));
+    int k = 0;
+    stats.Add(Time("day card open/close frame", 240, delegate { int i = k++; sheet.FrameMsForTest((i < 120 ? i : 240 - i) / 120.0, false); }));
+    sheet.TickFirstForTest();
+    stats.Add(Time("day card tick animation", 240, delegate { sheet.StepForTest(1 / 240.0); sheet.FrameMsForTest(1, true); }));
+    sheet.BeginNewForTest();
+    stats.Add(Time("day card typing redraw", 120, delegate { sheet.HandleChar('字'); sheet.FrameMsForTest(1, true); }));
+    sheet.PrepareForTest(DaySheet.SheetMode.Agenda, today, work);
+    if (dir != null) using (var shot = sheet.RenderSnapshot()) Save(shot, Path.Combine(dir, "agenda-sheet.png"));
+   }
+   if (dir != null) {
+    using (var alert = new AlertSheet(app)) {
+     alert.SizeCardForTest(alert.Measure("移除“开发空间”？", "文件夹里的快捷入口会一起移除，原有应用和文件会保留。", "移除"));
+     using (var shot = alert.RenderSnapshot()) Save(shot, Path.Combine(dir, "alert.png"));
+    }
+    using (var toast = new Toast(app)) {
+     toast.SizeCardForTest(toast.Measure("目标已不存在，请编辑入口更新路径。", work.Width));
+     using (var shot = toast.RenderSnapshot()) Save(shot, Path.Combine(dir, "toast.png"));
+    }
+   }
+   return stats.ToArray();
+  }
+
+  // Premultiplied snapshot over a neutral backdrop so translucency is visible.
+  static void Save(Bitmap shot, string path) {
+   using (var copy = new Bitmap(shot.Width, shot.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+   using (var g = Graphics.FromImage(copy)) {
+    g.Clear(Color.FromArgb(255, 40, 44, 52));
+    g.DrawImage(shot, 0, 0, shot.Width, shot.Height);
+    copy.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+   }
+  }
+
   internal static int Run(string output) {
    string root = Path.Combine(Path.GetTempPath(), "MacDeskBench-" + Guid.NewGuid().ToString("N"));
    Directory.CreateDirectory(root);
@@ -65,9 +114,11 @@ namespace MacDeskNative {
     using (var app = new AppController(root, false, true)) {
      int items = 0; foreach (var g in app.Data.groups) items += g.items.Count;
      report.AppendLine("groups " + app.Data.groups.Count + ", items " + items);
+     SeedReminders(app);
      var desk = new DesktopFolderForm(app);
      foreach (Stat s in desk.Bench()) report.AppendLine(s.ToString());
      foreach (Stat s in app.Home.Bench()) report.AppendLine(s.ToString());
+     foreach (Stat s in Popups(app)) report.AppendLine(s.ToString());
      DeskGroup biggest = null;
      foreach (var g in app.Data.groups) if (biggest == null || g.items.Count > biggest.items.Count) biggest = g;
      if (biggest != null) {

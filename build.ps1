@@ -16,7 +16,15 @@ $coreDll = Join-Path $OutputDirectory 'MacDesk.Core.dll'
 & $csc @common /target:library /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:Microsoft.CSharp.dll ('/out:' + $coreDll) $core
 if ($LASTEXITCODE -ne 0) { throw 'backend (src\Core) failed to build on its own - it must not reference UI code' }
 
-# 2) The app: one self-contained exe (backend + frontend compiled together).
+# 2) Frontend boundary check: src\UI reaches the backend only through DeskService (plus the
+#    plain data types). Calling the backend's helpers directly would skip its validation.
+$leaks = @(Get-ChildItem (Join-Path $src 'UI') -Filter *.cs -Recurse | Select-String -Pattern '\b(EntryServices|IconProvider|DesktopStore)\.|new\s+(DesktopStore|AppCatalog)\b')
+if ($leaks.Count -gt 0) {
+ $where = ($leaks | ForEach-Object { $_.Filename + ':' + $_.LineNumber }) -join ', '
+ throw ('src\UI must use the backend only through DeskService: ' + $where)
+}
+
+# 3) The app: one self-contained exe (backend + frontend compiled together).
 $exe = Join-Path $OutputDirectory 'MacDesk.exe'
 $icon = Join-Path $PSScriptRoot 'assets\app.ico'
 $iconArg = if (Test-Path $icon) { '/win32icon:' + $icon } else { $null }
@@ -25,7 +33,7 @@ $iconArg = if (Test-Path $icon) { '/win32icon:' + $icon } else { $null }
     ('/win32manifest:' + (Join-Path $src 'Native.manifest')) $iconArg ('/out:' + $exe) ($core + $ui)
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
-# 3) Deploy to a Medium-integrity folder (the repo folder is Low-IL; see README).
+# 4) Deploy to a Medium-integrity folder (the repo folder is Low-IL; see README).
 if (-not $NoDeploy) {
  $docDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'MacDesk'
  [void][IO.Directory]::CreateDirectory($docDir)

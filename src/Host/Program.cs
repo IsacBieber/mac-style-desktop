@@ -158,6 +158,7 @@ namespace MacDeskNative {
    CheckFolderGlass();
    CheckCompactCalendar();
    CheckDesktopGrid();
+   CheckTextField();
    // Frontend: springs, controller wiring, folder transition.
    var spring=new Spring(0,0.3,0.8);spring.Target=1;for(int i=0;i<240;i++)spring.Step(1/240.0);var spring60=new Spring(0,0.3,0.8);spring60.Target=1;for(int i=0;i<60;i++)spring60.Step(1/60.0);
    Check(spring.Settled&&spring60.Settled&&Math.Abs(spring.Value-1)<0.001,"interactive springs settle the same at 60 and 240 Hz");
@@ -204,10 +205,96 @@ namespace MacDeskNative {
       Check(category.Text == gridFixture.title &&
        category.DropDownItems.Count == 9, "tray groups non-app shortcuts and leaves out apps");
      }
+    CheckReminderUi(app);
     app.Quit();
    }
    File.WriteAllText(Path.Combine(root,"PASS.txt"),"Backend (CoreTests) and frontend self-tests passed.");
   }
+  // The shared in-place text field (rename, day card): caret editing without a focused control.
+  static void CheckTextField() {
+   var f = new TextField { MaxLength = 10 };
+   f.Reset("abc", true);
+   f.HandleChar('x');
+   Check(f.Text == "x" && f.Caret == 1, "typing replaces a selected field");
+   f.HandleKey(Keys.Home); f.Insert("12");
+   Check(f.Text == "12x" && f.Caret == 2, "insert at the caret");
+   f.HandleKey(Keys.Right); f.HandleKey(Keys.Back);
+   Check(f.Text == "12" && f.Caret == 2, "backspace removes the character before the caret");
+   f.HandleKey(Keys.Left); f.HandleKey(Keys.Delete);
+   Check(f.Text == "1", "delete removes the character after the caret");
+   f.HandleKey(Keys.Control | Keys.A); f.HandleKey(Keys.Back);
+   Check(f.Text == "", "select all, then backspace clears");
+   f.Insert("a\r\nb\nc");
+   Check(f.Text == "a b c", "pasted line breaks become spaces");
+   f.Insert("0123456789");
+   Check(f.Text.Length == 10, "max length");
+   f.Reset("", false);
+   f.HandleChar('\b');
+   Check(f.Text == "", "control characters are not inserted");
+   Check(!f.HandleKey(Keys.A) && !f.HandleKey(Keys.Enter) && f.HandleKey(Keys.Control | Keys.S), "typing keys reach WM_CHAR; Enter is the owner's; shortcuts are swallowed");
+  }
+
+  sealed class KeyProbe : IKeyTarget {
+   public string Typed = "";
+   public bool HandleKey(Keys k) { return k == Keys.Escape; }
+   public bool HandleChar(char c) { Typed += c; return true; }
+  }
+
+  // Popups, the day card and the reminders widget, laid out offscreen (nothing is shown).
+  static void CheckReminderUi(AppController app) {
+   var probe = new KeyProbe();
+   app.PushKeyTarget(probe);
+   Check(app.KeyboardPopupOpen && app.RouteChar('好') && probe.Typed == "好" && app.RouteKey(Keys.Escape), "keys go to the popup on top");
+   app.PopKeyTarget(probe);
+   Check(!app.KeyboardPopupOpen && !app.RouteChar('x'), "keys go back to the folder panel (none open here)");
+
+   string today = Reminders.TodayKey(), yesterday = Reminders.AddDays(today, -1);
+   Check(Reminders.RelativeDay(yesterday, today) == "昨天" && Reminders.RelativeDay(Reminders.AddDays(today, 1), today) == "明天", "relative day wording");
+   var a = app.AddTodo("今天第一项", today);
+   var b = app.AddTodo("今天第二项", today);
+   var c = app.AddTodo("昨天没做完", yesterday);
+   var u = app.AddTodo("没有日期", "");
+   Check(a != null && b != null && c != null && u != null, "controller adds reminders");
+   Rectangle work = Screen.PrimaryScreen.WorkingArea;
+   using (var sheet = new DaySheet(app)) {
+    sheet.PrepareForTest(DaySheet.SheetMode.Day, today, work);
+    var rects = sheet.RowRects();
+    Check(rects.Count == 4, "day card: two reminders, the add row and the note row");
+    for (int i = 1; i < rects.Count; i++) Check(Math.Abs(rects[i].Top - rects[i - 1].Bottom) < 0.01f, "day card rows are stacked without gaps or overlap");
+    sheet.PrepareForTest(DaySheet.SheetMode.Agenda, today, work);
+    Check(sheet.RowCount == 3 + 4 + 1, "agenda: three sections, four reminders, the add row");
+    using (var shot = sheet.RenderSnapshot())
+     Check(shot.Width == DaySheet.CardWidth + 36 && shot.GetPixel(shot.Width / 2, shot.Height / 2).A > 200 && shot.GetPixel(1, 1).A < 40, "day card: solid glass inside, soft transparent edge");
+   }
+   using (var alert = new AlertSheet(app)) {
+    Size size = alert.Measure("移除“开发空间”？", "文件夹里的快捷入口会一起移除，原有应用和文件会保留。", "移除");
+    Check(size.Width == 290 && size.Height > 100 && size.Height < 200, "alert size");
+   }
+   using (var toast = new Toast(app)) {
+    Size one = toast.Measure("目标已不存在。", 1920), two = toast.Measure(new string('长', 80), 1920);
+    Check(one.Height == 46 && two.Height == 64 && two.Width <= 560, "toast grows to two lines, never wider than 560");
+   }
+
+   app.Home.RefreshData();
+   var w = app.Home.ReminderWidget;
+   Check(w.VisibleRows == 4 && w.OpenCount == 4, "widget lists overdue, today and undated reminders");
+   DeskTodo hit; RectangleF r;
+   RectangleF row0 = w.RowRect(0);
+   int cy = (int)(row0.Y + row0.Height / 2);
+   Check(w.HitTest(new Point(w.CheckColumnRight - 6, cy), out hit, out r) == TodoWidget.HitKind.Check && hit.id == c.id, "widget: first row is the overdue reminder, its ring is hit where it is drawn");
+   Check(w.HitTest(new Point(w.Bounds.X + 140, cy), out hit, out r) == TodoWidget.HitKind.Row && hit.id == c.id, "widget: title hit");
+   Rectangle plus = w.PlusBounds;
+   Check(w.HitTest(new Point(plus.X + plus.Width / 2, plus.Y + plus.Height / 2), out hit, out r) == TodoWidget.HitKind.Plus, "widget: plus button hit");
+   Check(w.Bounds.Width == TodoWidget.CardWidth && w.Bounds.Height == TodoWidget.CardHeight, "widget has a fixed size");
+   app.ToggleTodoSoon(a.id, true);
+   Check(app.Service.FindTodo(a.id).done && app.IsTodoDone(app.Service.FindTodo(a.id)), "a tick is saved (test mode saves at once)");
+   app.Home.RefreshData();
+   Check(w.OpenCount == 3, "a completed reminder leaves the widget count");
+   Check(app.DeleteTodo(u.id) && app.Service.FindTodo(u.id) == null, "delete reminder");
+   string g = app.Data.groups[0].id, item = app.Data.groups[0].items.Count > 0 ? app.Data.groups[0].items[0].id : null;
+   if (item != null) { app.DeleteItem(g, item); Check(app.Service.FindItem(g, item) == null, "delete icon goes through the confirmation path"); }
+  }
+
   static void CheckFolderGlass() {
    var view = new Rectangle(-210, 95, 96, 64);
    var clip = new Rectangle(view.Left + 13, view.Top + 8, 37, 42);

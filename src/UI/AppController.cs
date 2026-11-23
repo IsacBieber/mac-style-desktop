@@ -20,7 +20,7 @@ namespace MacDeskNative {
   public bool ModalInProgress { get { return modalDepth > 0; } }
   int modalDepth;
   public FolderLayer Panel { get; private set; }
-  internal AppCatalog Catalog { get; private set; }
+  internal AppCatalog Catalog { get { return Service.Catalog; } }
 
   NotifyIcon tray;
   bool closing, refreshQueued, testMode;
@@ -123,13 +123,53 @@ namespace MacDeskNative {
    if (old != null) { old.Hide(); old.Dispose(); }
    if (backdrop != null) { backdrop.Dispose(); backdrop = null; }
    if (Panel != null && !Panel.IsDisposed) Panel.SetBackdrop(null);
-   if (DesktopFolders != null && !DesktopFolders.IsDisposed) { DesktopFolders.SetOpenFolder(null); DesktopFolders.ReleaseKeyboardFocus(); }
+   if (DesktopFolders != null && !DesktopFolders.IsDisposed) {
+    DesktopFolders.SetOpenFolder(null);
+    if (keyTargets.Count == 0) DesktopFolders.ReleaseKeyboardFocus();
+   }
+  }
+
+  // ---- Popups and keyboard routing ----------------------------------------------------------
+  // Glass popups (day sheet, alerts, toasts) are top-level, non-activating windows owned by
+  // the hidden dialog owner. Those that take the keyboard sit on a stack above the folder panel:
+  // keys go to the top of the stack, then to the panel.
+
+  readonly List<IKeyTarget> keyTargets = new List<IKeyTarget>();
+  readonly List<GlassPopup> popups = new List<GlassPopup>();
+
+  internal Form PopupOwner { get { return OwnDialogWindow(); } }
+  /// True while a popup owns the keyboard (the folder panel then ignores outside presses).
+  internal bool KeyboardPopupOpen { get { return keyTargets.Count > 0; } }
+
+  internal void PushKeyTarget(IKeyTarget target) {
+   keyTargets.Remove(target);
+   keyTargets.Add(target);
+   if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.TakeKeyboardFocus();
+  }
+  internal void PopKeyTarget(IKeyTarget target) {
+   if (!keyTargets.Remove(target) || keyTargets.Count > 0) return;
+   bool panelOpen = Panel != null && !Panel.IsDisposed && Panel.Visible;
+   if (!panelOpen && DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.ReleaseKeyboardFocus();
+  }
+  internal void RegisterPopup(GlassPopup popup) { if (!popups.Contains(popup)) popups.Add(popup); }
+  internal void UnregisterPopup(GlassPopup popup) { popups.Remove(popup); }
+  /// Whether a screen point lies on one of our visible popups (other than `except`).
+  internal bool PopupContains(Point screen, GlassPopup except) {
+   foreach (var popup in popups)
+    if (popup != except && !popup.IsDisposed && popup.Visible && popup.CardScreenRect.Contains(screen)) return true;
+   return false;
+  }
+  internal void BringPopupToTop(GlassPopup popup) {
+   BringToTop(popup);
+   // Toasts stay above everything else of ours.
+   foreach (var other in popups) if (other != popup && other is Toast) BringToTop(other);
   }
 
   // The folder UI never takes activation (that would kick Windows out of "show desktop" and
   // restore every window over it). Keyboard input is received by the desktop-layer window,
   // which lives inside the desktop's own focus, and routed here.
   internal bool RouteKey(Keys key) {
+   if (keyTargets.Count > 0) return keyTargets[keyTargets.Count - 1].HandleKey(key);
    Keys code = key & Keys.KeyCode;
    bool modifierOnly = code == Keys.ShiftKey || code == Keys.ControlKey || code == Keys.Menu || code == Keys.LWin || code == Keys.RWin;
    if (Panel == null || Panel.IsDisposed || !Panel.Visible) return false;
@@ -139,6 +179,7 @@ namespace MacDeskNative {
    return Panel.HandleKey(key);
   }
   internal bool RouteChar(char c) {
+   if (keyTargets.Count > 0) return keyTargets[keyTargets.Count - 1].HandleChar(c);
    if (Panel == null || Panel.IsDisposed || !Panel.Visible || Panel.IsClosing) return false;
    Panel.CompleteOpening();
    return Panel.HandleChar(c);
@@ -156,8 +197,7 @@ namespace MacDeskNative {
    testMode = !show;
    try {
     Service = new DeskService(root);
-    Catalog = new AppCatalog(Service.Root);
-    Service.Changed += delegate { QueueRefresh(); };
+    Service.Changed += delegate(object sender, EventArgs e) { QueueRefresh(DeskChangedEventArgs.KindsOf(e)); };
     if (seedIfEmpty) Service.SeedStarterGroupsIfNew();
     // Desktop folders are laid out by order on a fixed grid (like a phone home screen);
     // turn any free positions saved by older versions into that order, once.
@@ -194,7 +234,92 @@ namespace MacDeskNative {
   public void ReportError(Exception ex) { Fail(ex); }
   void Fail(Exception ex) {
    if (testMode) throw ex;
-   Modal(owner => MessageBox.Show(owner, ex.Message, "MacDesk · 操作未完成", MessageBoxButtons.OK, MessageBoxIcon.Warning));
+   ShowToast(ex.Message);
+  }
+
+  // ---- Glass popups: toast, alert, day sheet -------------------------------------------------
+
+  Toast toast;
+  AlertSheet alert;
+  DaySheet daySheet;
+
+  /// Shows a short message at the top of the screen (errors; replaces the Win32 message box).
+  public void ShowToast(string message) {
+   if (closing) return;
+   if (toast == null || toast.IsDisposed) toast = new Toast(this);
+   Point at = Panel != null && !Panel.IsDisposed && Panel.Visible ? Panel.ScreenRect.Location : Cursor.Position;
+   toast.ShowMessage(message, Screen.FromPoint(at).WorkingArea);
+  }
+  internal Toast CurrentToast { get { return toast; } }
+  internal AlertSheet CurrentAlert { get { return alert; } }
+  internal DaySheet CurrentDaySheet { get { return daySheet; } }
+
+  /// iOS-style confirmation over the open folder (or the screen centre); runs onConfirm on OK.
+  public void Confirm(string title, string message, string actionLabel, Point near, Action onConfirm) {
+   if (testMode) { onConfirm(); return; }
+   if (closing) return;
+   if (alert == null || alert.IsDisposed) alert = new AlertSheet(this);
+   Rectangle over = Panel != null && !Panel.IsDisposed && Panel.Visible && !Panel.IsClosing ? Panel.ScreenRect : Screen.FromPoint(near).WorkingArea;
+   alert.Ask(title, message, actionLabel, over, onConfirm);
+  }
+
+  /// The day card for a calendar day, beside the calendar (besideScreen), grown from the day.
+  public void ShowDay(string dateKey, Rectangle besideScreen, RectangleF dayScreen) {
+   if (closing) return;
+   if (daySheet == null || daySheet.IsDisposed) daySheet = new DaySheet(this);
+   try { daySheet.ShowDay(dateKey, besideScreen, dayScreen); } catch (Exception ex) { Fail(ex); }
+  }
+  /// The agenda card (overdue / today / undated) beside the reminders widget.
+  public void ShowAgenda(Rectangle besideScreen, RectangleF fromScreen, bool startAdding) {
+   if (closing) return;
+   if (daySheet == null || daySheet.IsDisposed) daySheet = new DaySheet(this);
+   try { daySheet.ShowAgenda(besideScreen, fromScreen, startAdding); } catch (Exception ex) { Fail(ex); }
+  }
+
+  // ---- Reminders -----------------------------------------------------------------------------
+  // Ticking a reminder animates at once; the save waits until the views have settled (a disk
+  // write mid-animation would drop frames), and quick successive ticks are saved together.
+
+  readonly Dictionary<string, bool> pendingDone = new Dictionary<string, bool>();
+  System.Windows.Forms.Timer doneFlush;
+
+  /// What a view should show for `todo` (a pending tick wins over the saved state).
+  internal bool IsTodoDone(DeskTodo todo) {
+   bool done;
+   return todo != null && (pendingDone.TryGetValue(todo.id, out done) ? done : todo.done);
+  }
+  internal bool HasPendingTicks { get { return pendingDone.Count > 0; } }
+
+  internal void ToggleTodoSoon(string todoId, bool done) {
+   pendingDone[todoId] = done;
+   if (testMode) { FlushTodoTicks(); return; }
+   if (doneFlush == null) {
+    doneFlush = new System.Windows.Forms.Timer { Interval = 520 };
+    doneFlush.Tick += delegate { FlushTodoTicks(); };
+   }
+   doneFlush.Stop();
+   doneFlush.Start();
+   if (Home != null && !Home.IsDisposed) Home.RefreshData();
+  }
+
+  internal void FlushTodoTicks() {
+   if (doneFlush != null) doneFlush.Stop();
+   if (pendingDone.Count == 0) return;
+   var states = new Dictionary<string, bool>(pendingDone);
+   pendingDone.Clear();
+   Try(delegate { Service.SetTodosDone(states); });
+  }
+
+  public DeskTodo AddTodo(string title, string dueDateKey) {
+   DeskTodo added = null;
+   Try(delegate { added = Service.AddTodo(title, dueDateKey); });
+   return added;
+  }
+  public bool RenameTodo(string todoId, string title) { return Try(delegate { Service.RenameTodo(todoId, title); }); }
+  public bool SetTodoDue(string todoId, string dueDateKey) { return Try(delegate { Service.SetTodoDue(todoId, dueDateKey); }); }
+  public bool DeleteTodo(string todoId) {
+   pendingDone.Remove(todoId);
+   return Try(delegate { Service.DeleteTodo(todoId); });
   }
 
   Form dialogOwner;
@@ -261,13 +386,23 @@ namespace MacDeskNative {
    return g;
   }
 
-  void QueueRefresh() {
+  // Changes are coalesced into one refresh per message-loop turn, and each view only redraws
+  // for the kinds of data it shows (ticking a reminder does not touch the desktop folders).
+  DeskChange pendingChanges;
+  void QueueRefresh(DeskChange kinds) {
+   pendingChanges |= kinds;
    if (refreshQueued || closing || Home == null || Home.IsDisposed) return;
    refreshQueued = true;
    Action action = delegate {
     refreshQueued = false;
+    DeskChange changed = pendingChanges;
+    pendingChanges = DeskChange.None;
     if (closing || Home == null || Home.IsDisposed) return;
-    Home.RefreshData();
+    if ((changed & (DeskChange.Notes | DeskChange.Todos | DeskChange.Prefs)) != 0) {
+     Home.RefreshData();
+     if (daySheet != null && !daySheet.IsDisposed) daySheet.RefreshData();
+    }
+    if ((changed & (DeskChange.Groups | DeskChange.Prefs)) == 0) return;
     if (DesktopFolders != null && !DesktopFolders.IsDisposed) DesktopFolders.RefreshData();
     if (Panel != null && Panel.Visible) {
      if (Data.groups.Any(g => g.id == Panel.GroupId)) Panel.RefreshData();
@@ -329,13 +464,24 @@ namespace MacDeskNative {
   }
 
 
-  public void AddGroup() { var g = Modal(owner => EditDialogs.Group(owner, null)); if (g != null) Try(delegate { Service.AddGroup(g); }); }
+  // New folders open at once with the title ready to type over (iOS); the tray, Ctrl+N and
+  // the widget menu all take this one path.
+  public void AddGroup() {
+   Rectangle work = Screen.FromPoint(Cursor.Position).WorkingArea;
+   CreateAndOpenNewGroup(new Point(work.X + work.Width / 2, work.Y + work.Height / 3));
+  }
   public void CreateAndOpenNewGroup(Point sourceCenter) {
    DeskGroup g = null;
    if (Try(delegate { g = Service.CreateGroupWithUniqueTitle("新文件夹"); })) {
     if (DesktopFolders != null) DesktopFolders.RefreshData();
     OpenGroup(g.id, sourceCenter);
+    if (Panel != null && !Panel.IsDisposed && Panel.Visible && Panel.GroupId == g.id) Panel.RenameTitleOnLand();
    }
+  }
+  /// Desktop folder menu "重命名": open the folder and edit its title in place.
+  public void RenameGroupFromDesktop(string id, Point sourceCenter) {
+   if (Panel == null || Panel.IsDisposed || !Panel.Visible || Panel.GroupId != id || Panel.IsClosing) OpenGroup(id, sourceCenter);
+   if (Panel != null && !Panel.IsDisposed && Panel.Visible && Panel.GroupId == id) Panel.RenameTitleOnLand();
   }
   public bool RenameGroupInline(string groupId, string newTitle) {
    if ((newTitle ?? "").Trim().Length == 0) return false;
@@ -354,26 +500,15 @@ namespace MacDeskNative {
    if (files != null && files.Length > 0) TryAddPaths(groupId, files, -1);
   }
   public void PickFolderToAdd(string groupId) {
-   string folder = Modal(owner => {
-     using (var f = new FolderBrowserDialog { Description = "选择目录，添加到托盘的「其他快捷入口」" }) {
-     return f.ShowDialog(owner) == DialogResult.OK ? f.SelectedPath : null;
-    }
-   });
+   string folder = Modal(owner => FolderPicker.Pick(owner, "选择目录，添加到托盘的「其他快捷入口」"));
    if (!String.IsNullOrEmpty(folder)) TryAddPaths(groupId, new[] { folder }, -1);
-  }
-  public void EditGroup(string id) {
-   try {
-    var original = Group(id);
-    string title = original.title, subtitle = original.subtitle;
-    var g = Modal(owner => EditDialogs.Group(owner, original));
-    if (g != null) Service.UpdateGroup(id, title, subtitle, g.title, g.subtitle);
-   } catch (Exception ex) { Fail(ex); }
   }
   public void DeleteGroup(string id) {
    try {
     var g = Group(id);
-    if (Modal(owner => MessageBox.Show(owner, "删除文件夹“" + g.title + "”及其中的入口？\n不会删除或移动任何原文件。", "删除文件夹", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning)) == DialogResult.OK)
-     Service.DeleteGroup(id);
+    Rectangle? tile = DesktopFolders != null && !DesktopFolders.IsDisposed ? DesktopFolders.IconRectOnScreen(id) : null;
+    Point near = tile.HasValue ? new Point(tile.Value.X + tile.Value.Width / 2, tile.Value.Y) : Cursor.Position;
+    Confirm("移除“" + g.title + "”？", "文件夹里的快捷入口会一起移除，原有应用和文件会保留。", "移除", near, delegate { Try(delegate { Service.DeleteGroup(id); }); });
    } catch (Exception ex) { Fail(ex); }
   }
   public void AddItem(string groupId) { var item = Modal(owner => EditDialogs.Item(owner, null)); if (item != null) Try(delegate { Service.AddItem(groupId, item); }); }
@@ -390,17 +525,11 @@ namespace MacDeskNative {
    return Try(delegate { Service.RenameItem(groupId, itemId, newTitle); });
   }
   public bool SetCalendarNote(string dateKey, string noteText) { return Try(delegate { Service.SetNote(dateKey, noteText); }); }
-  public void EditCalendarNote(string dateKey, Point screenLocation) {
-   try {
-    string existing = Service.GetNote(dateKey);
-    string updated = Modal(owner => EditDialogs.CalendarNote(owner, dateKey, existing, screenLocation));
-    if (updated != null) SetCalendarNote(dateKey, updated);
-   } catch (Exception ex) { Fail(ex); }
-  }
   public void ToggleShowLabels() { Try(delegate { Service.ToggleShowLabels(); }); }
   public void DeleteItem(string groupId, string itemId) {
-   if (Modal(owner => MessageBox.Show(owner, "只删除此入口，不会删除原文件。", "移除入口", MessageBoxButtons.OKCancel, MessageBoxIcon.Question)) == DialogResult.OK)
-    Try(delegate { Service.DeleteItem(groupId, itemId); });
+   DeskItem item = Service.FindItem(groupId, itemId);
+   if (item == null) return;
+   Confirm("移除“" + item.title + "”？", "只从 MacDesk 移除这个图标，原有应用和文件会保留。", "移除", Cursor.Position, delegate { Try(delegate { Service.DeleteItem(groupId, itemId); }); });
   }
   public bool TryMoveItem(string sourceGroup, string itemId, string targetGroup, int insertIndex) { return Try(delegate { Service.MoveItem(sourceGroup, itemId, targetGroup, insertIndex); }); }
   public bool TryMoveGroup(string groupId, int targetIndex) { return Try(delegate { Service.MoveGroup(groupId, targetIndex); }); }
@@ -421,7 +550,7 @@ namespace MacDeskNative {
    // resolve the shortcut or prompt for elevation even with a responsive panel.
    var ui = TaskScheduler.FromCurrentSynchronizationContext();
    launchingApps.Add(itemId);
-   Task.Factory.StartNew(() => EntryServices.OpenDesktopApp(item), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default)
+   Task.Factory.StartNew(() => DeskService.OpenAppOnWorker(item), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default)
     .ContinueWith(task => {
      launchingApps.Remove(itemId);
      Exception error = task.Exception;
@@ -435,6 +564,9 @@ namespace MacDeskNative {
   }
   public void RunEntryAction(Action action, bool closeAfter) {
    if (Try(action) && closeAfter) ClosePanel();
+  }
+  public void OpenEntryWith(string groupId, string itemId, EntryAction action) {
+   RunEntryAction(delegate { Service.OpenWith(groupId, itemId, action); }, true);
   }
   internal void PopulateOtherShortcuts(ToolStripMenuItem menu) {
    while (menu.DropDownItems.Count > 0) {
@@ -482,20 +614,9 @@ namespace MacDeskNative {
      PopulateOtherShortcuts(shortcuts);
      menuData = Data;
     };
-   menu.Items.Add("在资源管理器打开桌面目录", null, delegate {
-    Try(delegate {
-     string directory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-     EntryServices.Open(new DeskItem { type = "folder", target = directory });
-    });
-   });
+   menu.Items.Add("在资源管理器打开桌面目录", null, delegate { Try(delegate { Service.OpenFolder(DataFolder.Desktop); }); });
    menu.Items.Add("重新读取配置", null, delegate { try { Service.Reload(); Wallpaper.Refresh(true); } catch (Exception ex) { Fail(ex); } });
-   menu.Items.Add("打开备份目录", null, delegate {
-    try {
-     string dir = Path.Combine(Service.Root, "Backups");
-     Directory.CreateDirectory(dir);
-     EntryServices.Open(new DeskItem { type = "folder", target = dir });
-    } catch (Exception ex) { Fail(ex); }
-   });
+   menu.Items.Add("打开备份目录", null, delegate { Try(delegate { Service.OpenFolder(DataFolder.Backups); }); });
    menu.Items.Add(new ToolStripSeparator());
    menu.Items.Add("退出 MacDesk", null, delegate { Quit(); });
    tray.ContextMenuStrip = menu;
@@ -505,6 +626,12 @@ namespace MacDeskNative {
    if (closing) return;
    closing = true;
    try {
+    FlushTodoTicks();
+    if (doneFlush != null) doneFlush.Dispose();
+    foreach (var popup in new List<GlassPopup>(popups)) popup.DismissNow();
+    if (daySheet != null) daySheet.Dispose();
+    if (alert != null) alert.Dispose();
+    if (toast != null) toast.Dispose();
     HideDim();
     DiscardPrefetch();
     if (icons != null) { icons.Dispose(); icons = null; }

@@ -13,16 +13,20 @@ using System.Web.Script.Serialization;
 namespace MacDesk.Core {
  // Persisted data (desktop.json). Plain DTOs: lower-case names are the JSON field names.
  public class DesktopData {
+  /// Version 2 added `todos`. DesktopStore.Reload migrates version 1 files in memory.
+  public const int CurrentVersion = 2;
   public int version { get; set; }
   public List<DeskGroup> groups { get; set; }
   public Dictionary<string, string> notes { get; set; }
+  public List<DeskTodo> todos { get; set; }
   public bool showLabels { get; set; }
   public int homeX { get; set; }
   public int homeY { get; set; }
   public DesktopData() {
-   version = 1;
+   version = CurrentVersion;
    groups = new List<DeskGroup>();
    notes = new Dictionary<string, string>();
+   todos = new List<DeskTodo>();
    showLabels = false;
    homeX = -1;
    homeY = -1;
@@ -32,6 +36,7 @@ namespace MacDesk.Core {
    var copy = (DesktopData)MemberwiseClone();
    copy.notes = new Dictionary<string, string>(notes, notes.Comparer);
    copy.groups = groups.ConvertAll(group => group.CopyForEdit());
+   copy.todos = todos.ConvertAll(todo => todo.CopyForEdit());
    return copy;
   }
  }
@@ -64,5 +69,23 @@ namespace MacDesk.Core {
   public string arguments { get; set; }
 
   internal DeskItem CopyForEdit() { return (DeskItem)MemberwiseClone(); }
+ }
+ /// A reminder. `due` is "" (no date) or "yyyy-MM-dd"; `created` / `completed` are UTC
+ /// ISO-8601 stamps ("" while not completed). List order is display order.
+ public class DeskTodo {
+  public string id { get; set; }
+  public string title { get; set; }
+  public bool done { get; set; }
+  public string due { get; set; }
+  public string created { get; set; }
+  public string completed { get; set; }
+  public DeskTodo() {
+   title = "";
+   due = "";
+   created = "";
+   completed = "";
+  }
+
+  internal DeskTodo CopyForEdit() { return (DeskTodo)MemberwiseClone(); }
  }
 }

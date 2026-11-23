@@ -68,13 +68,12 @@ namespace MacDeskNative {
 
   // In-panel text editing (rename). The panel never takes focus, so keys are routed here
   // from the desktop layer and the field is drawn by us, like the search field.
-  private bool editing, editSelectAll;
-  private string editText = "";
+  private bool editing;
+  private readonly TextField editField = new TextField { MaxLength = 120 };
   private string renamingGroupId, renamingItemId;
   private bool renamingFolderTitle;
 
-  private readonly Timer outsideClickTimer;
-  private bool leftWasDown, rightWasDown;
+  private readonly OutsideClickWatcher outsideClicks;
 
   [DllImport("user32.dll")]
   private static extern short GetAsyncKeyState(int virtualKey);
@@ -113,6 +112,7 @@ namespace MacDeskNative {
 
    AttachDrop(this);
    pump = new FramePump(this, Tick);
+   editField.Changed += delegate { WakeAnimation(); };
 
    work = Screen.PrimaryScreen.WorkingArea;
    RefreshData();
@@ -120,9 +120,14 @@ namespace MacDeskNative {
    origin = FolderLayout.PanelOrigin(work.Size, panelSize);
    LayoutContent(true);
 
-   outsideClickTimer = new Timer();
-   outsideClickTimer.Interval = 30;
-   outsideClickTimer.Tick += PollOutsideClick;
+   outsideClicks = new OutsideClickWatcher(30) {
+    Paused = OutsideClicksPaused,
+    ForegroundLost = delegate { app.ClosePanel(); },
+    Pressed = delegate(Point screen) {
+     // Presses on our popups (an alert over the panel, a toast) are theirs, not "outside".
+     if (!PanelScreenRect().Contains(screen) && !app.PopupContains(screen, null)) app.ClosePanel();
+    }
+   };
   }
 
   // Never activated: taking focus away from the desktop would make Windows leave
@@ -203,6 +208,21 @@ namespace MacDeskNative {
 
   internal bool IsOpening { get { return Visible && progress.Target >= 1 && progress.Value < 1; } }
   internal bool IsClosing { get { return progress.Target <= 0; } }
+  /// Screen rectangle of the open panel (title band + sheet), for popups placed over it.
+  internal Rectangle ScreenRect { get { return PanelScreenRect(); } }
+
+  // New folder / desktop "重命名": edit the title in place as soon as the panel has landed.
+  private bool renameTitleOnLand;
+  internal void RenameTitleOnLand() {
+   if (IsOpening) { renameTitleOnLand = true; return; }
+   renameTitleOnLand = false;
+   StartFolderTitleRename();
+  }
+  private void LandedForRename() {
+   if (!renameTitleOnLand) return;
+   renameTitleOnLand = false;
+   StartFolderTitleRename();
+  }
   internal bool CanSetOpeningBackdrop { get { return IsOpening && progress.Value < 0.25; } }
 
   private Rectangle PanelScreenRect() { return new Rectangle(work.X + origin.X, work.Y + origin.Y, panelSize.Width, panelSize.Height); }
@@ -263,6 +283,7 @@ namespace MacDeskNative {
    if (!IsOpening) return;
    progress.Snap(1);
    titleReveal.Snap(1);
+   LandedForRename();
    WakeAnimation();
   }
 
@@ -276,7 +297,7 @@ namespace MacDeskNative {
    // A spring creeps toward its end for a long time. Once nothing on screen is more than half
    // a pixel from where it ends, land now: otherwise icons crawl by sub-pixel amounts (soft,
    // edges shimmering) and then snap crisp - which reads as a small shake after opening.
-   if (progress.Target >= 1 && (!moving || (1 - progress.Value) * TransitionSpan() < 0.5)) { progress.Snap(1); titleReveal.Snap(1); moving = false; }
+   if (progress.Target >= 1 && (!moving || (1 - progress.Value) * TransitionSpan() < 0.5)) { progress.Snap(1); titleReveal.Snap(1); moving = false; LandedForRename(); }
    if (BackdropAlpha != null) BackdropAlpha(Math.Max(0.0, Math.Min(1.0, progress.Value * 1.25)));
    if (progress.Target <= 0 && (!moving || progress.Value * TransitionSpan() < 0.5)) {
     progress.Snap(0);
@@ -1036,7 +1057,7 @@ namespace MacDeskNative {
   internal static Bitmap LoadIcon(DeskItem item) {
    Bitmap bmp = null;
    try {
-    using (var source = IconProvider.Load(item)) {
+    using (var source = DeskService.LoadIcon(item)) {
      bmp = new Bitmap(IconPx, IconPx, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
      using (var cg = Graphics.FromImage(bmp)) {
       Ui.PrepareQuality(cg);
@@ -1186,12 +1207,7 @@ namespace MacDeskNative {
   private void DrawSearchField(Graphics g) {
    float a = pickerMode ? 1f : (float)Math.Max(0, Math.Min(1, searchReveal.Value));
    Rectangle r = SearchRect();
-   using (var path = Ui.Squircle(r, r.Height / 2f))
-   using (var fill = new SolidBrush(Color.FromArgb((int)(96 * a), 0, 0, 0)))
-   using (var fill2 = new SolidBrush(Color.FromArgb((int)(24 * a), 255, 255, 255))) {
-    g.FillPath(fill, path);
-    g.FillPath(fill2, path);
-   }
+   TextField.DrawPill(g, r, r.Height / 2f, a, false);
    // Magnifier glyph.
    float cx = r.X + 20, cy = r.Y + r.Height / 2f - 1;
    using (var pen = new Pen(Color.FromArgb((int)(170 * a), 235, 235, 245), 1.8f)) {
@@ -1311,17 +1327,15 @@ namespace MacDeskNative {
 
   protected override void OnVisibleChanged(EventArgs e) {
    base.OnVisibleChanged(e);
-   if (outsideClickTimer == null) return;
-   outsideClickTimer.Stop();
+   if (outsideClicks == null) return;
+   outsideClicks.Stop();
    if (!Visible) {
     pump.Stop();
     if (editing) CommitInlineRename(true);
     return;
    }
    if (IsDisposed || Disposing || app == null || app.Panel != this) return;
-   leftWasDown = (GetAsyncKeyState(0x01) & 0x8000) != 0;
-   rightWasDown = (GetAsyncKeyState(0x02) & 0x8000) != 0;
-   outsideClickTimer.Start();
+   outsideClicks.Start();
    WakeAnimation();
   }
 
@@ -1607,11 +1621,11 @@ namespace MacDeskNative {
   }
 
   private void BeginEdit(bool folder, string gId, string iId, string text) {
+   renameTitleOnLand = false;
    renamingFolderTitle = folder;
    renamingGroupId = gId;
    renamingItemId = iId;
-   editText = text;
-   editSelectAll = true;
+   editField.Reset(text, true);
    editing = true;
    PlaceIme();
    WakeAnimation();
@@ -1634,57 +1648,25 @@ namespace MacDeskNative {
   }
 
   private void DrawEditField(Graphics g, RectangleF r, Font font) {
-   using (var path = Ui.Squircle(r, Math.Min(12f, r.Height / 2f)))
-   using (var fill = new SolidBrush(Color.FromArgb(150, 20, 20, 24)))
-   using (var pen = new Pen(Ui.Blue, 1.6f)) { g.FillPath(fill, path); g.DrawPath(pen, path); }
-   using (var f = Ui.Centered(true)) {
-    var inner = new RectangleF(r.X + 8, r.Y, r.Width - 16, r.Height);
-    SizeF size = g.MeasureString(editText.Length == 0 ? " " : editText, font, new SizeF(inner.Width, inner.Height), StringFormat.GenericTypographic);
-    float textW = Math.Min(inner.Width, size.Width);
-    if (editSelectAll && editText.Length > 0) {
-     var sel = new RectangleF(inner.X + (inner.Width - textW) / 2f - 2, r.Y + 4, textW + 4, r.Height - 8);
-     using (var b = new SolidBrush(Color.FromArgb(150, 10, 132, 255))) g.FillRectangle(b, sel);
-    }
-    using (var b = new SolidBrush(Color.White)) g.DrawString(editText, font, b, inner, f);
-    if (!editSelectAll) {
-     float cx = inner.X + (inner.Width + textW) / 2f + 2;
-     using (var caret = new Pen(Ui.Blue, 2f)) g.DrawLine(caret, cx, r.Y + 6, cx, r.Bottom - 6);
-    }
-   }
+   TextField.DrawPill(g, r, Math.Min(12f, r.Height / 2f), 1f, true);
+   editField.Draw(g, new RectangleF(r.X + 8, r.Y, r.Width - 16, r.Height), font, true, null, Theme.Label);
   }
 
   private bool HandleEditKey(Keys keyData) {
    if (keyData == Keys.Enter) { CommitInlineRename(true); return true; }
    if (keyData == Keys.Escape) { CommitInlineRename(false); return true; }
-   if (keyData == Keys.Back) {
-    if (editSelectAll) editText = ""; else if (editText.Length > 0) editText = editText.Substring(0, editText.Length - 1);
-    editSelectAll = false; WakeAnimation(); return true;
-   }
-   if (keyData == (Keys.Control | Keys.Back) || keyData == Keys.Delete) { editText = ""; editSelectAll = false; WakeAnimation(); return true; }
-   if (keyData == (Keys.Control | Keys.A)) { editSelectAll = true; WakeAnimation(); return true; }
-   if (keyData == (Keys.Control | Keys.V)) {
-    string clip = "";
-    try { clip = Clipboard.GetText() ?? ""; } catch { }
-    clip = clip.Replace("\r", " ").Replace("\n", " ");
-    editText = (editSelectAll ? "" : editText) + clip; editSelectAll = false; WakeAnimation(); return true;
-   }
-   // Plain typing keys must fall through so WM_CHAR (incl. IME text) still arrives.
-   Keys code = keyData & Keys.KeyCode;
-   bool modifier = (keyData & (Keys.Control | Keys.Alt)) != 0;
-   return modifier || code == Keys.Up || code == Keys.Down || code == Keys.Left || code == Keys.Right || code == Keys.Tab || (code >= Keys.F1 && code <= Keys.F24);
+   // Plain typing keys fall through so WM_CHAR (incl. IME text) still arrives.
+   return editField.HandleKey(keyData);
   }
 
   private void HandleEditChar(char c) {
-   if (char.IsControl(c)) return;
-   editText = (editSelectAll ? "" : editText) + c;
-   editSelectAll = false;
-   WakeAnimation();
+   editField.HandleChar(c);
   }
 
   private void CommitInlineRename(bool save) {
    if (!editing) return;
    bool isFolder = renamingFolderTitle;
-   string gId = renamingGroupId, iId = renamingItemId, text = editText;
+   string gId = renamingGroupId, iId = renamingItemId, text = editField.Text;
    editing = false;
    renamingFolderTitle = false;
    renamingGroupId = null;
@@ -1941,12 +1923,12 @@ namespace MacDeskNative {
 
    if (item.type != "url") {
     menu.Items.Add(new ToolStripSeparator());
-    menu.Items.Add("在终端中打开", null, MenuAction(delegate { app.RunEntryAction(delegate { EntryServices.OpenInTerminal(item); }, true); }));
-    if (EntryServices.FindEditorExecutable("vscode") != null)
-     menu.Items.Add("用 VS Code 打开", null, MenuAction(delegate { app.RunEntryAction(delegate { EntryServices.OpenInCodeEditor(item, "vscode"); }, true); }));
-    if (EntryServices.FindEditorExecutable("cursor") != null)
-     menu.Items.Add("用 Cursor 打开", null, MenuAction(delegate { app.RunEntryAction(delegate { EntryServices.OpenInCodeEditor(item, "cursor"); }, true); }));
-    menu.Items.Add("在资源管理器中显示", null, MenuAction(delegate { app.RunEntryAction(delegate { EntryServices.OpenContainingFolder(item); }, true); }));
+    menu.Items.Add("在终端中打开", null, MenuAction(delegate { app.OpenEntryWith(itemGroupId, itemId, EntryAction.Terminal); }));
+    if (DeskService.HasEditor(EntryAction.VSCode))
+     menu.Items.Add("用 VS Code 打开", null, MenuAction(delegate { app.OpenEntryWith(itemGroupId, itemId, EntryAction.VSCode); }));
+    if (DeskService.HasEditor(EntryAction.Cursor))
+     menu.Items.Add("用 Cursor 打开", null, MenuAction(delegate { app.OpenEntryWith(itemGroupId, itemId, EntryAction.Cursor); }));
+    menu.Items.Add("在资源管理器中显示", null, MenuAction(delegate { app.OpenEntryWith(itemGroupId, itemId, EntryAction.Reveal); }));
    }
    menu.Items.Add(item.type == "url" ? "复制网址" : "复制路径", null, MenuAction(delegate { app.RunEntryAction(delegate { if (!String.IsNullOrEmpty(item.target)) Clipboard.SetText(item.target); }, false); }));
 
@@ -1970,7 +1952,7 @@ namespace MacDeskNative {
    }
 
    menu.Items.Add(new ToolStripSeparator());
-   ToolStripItem remove = menu.Items.Add("移除（不删除原文件）", null, MenuAction(delegate { app.DeleteItem(itemGroupId, itemId); }));
+   ToolStripItem remove = menu.Items.Add("移除图标", null, MenuAction(delegate { app.DeleteItem(itemGroupId, itemId); }));
    remove.Tag = PanelDrawing.Destructive;
    menu.Show(this, ToWindow(point));
   }
@@ -1995,21 +1977,13 @@ namespace MacDeskNative {
    return c == "Progman" || c == "WorkerW";
   }
 
-  private void PollOutsideClick(object sender, EventArgs e) {
-   if (IsDisposed || Disposing || !Visible || app.Panel != this) {
-    outsideClickTimer.Stop();
-    return;
-   }
-   if (app.ModalInProgress || draggingItem || pendingMenuActions != 0) return;
-   foreach (ContextMenuStrip menu in activeMenus) if (!menu.IsDisposed && menu.Visible) return;
-   if (!ForegroundAllowsPanel()) { app.ClosePanel(); return; }
-   bool left = (GetAsyncKeyState(0x01) & 0x8000) != 0;
-   bool right = (GetAsyncKeyState(0x02) & 0x8000) != 0;
-   bool pressedEdge = (left && !leftWasDown) || (right && !rightWasDown);
-   leftWasDown = left;
-   rightWasDown = right;
-   if (!pressedEdge) return;
-   if (!PanelScreenRect().Contains(Control.MousePosition)) app.ClosePanel();
+  // A press swallowed while paused is not replayed afterwards (clicking outside an open menu
+  // closes just the menu, like macOS).
+  private bool OutsideClicksPaused() {
+   if (IsDisposed || Disposing || !Visible || app.Panel != this) { outsideClicks.Stop(); return true; }
+   if (app.ModalInProgress || app.KeyboardPopupOpen || draggingItem || pendingMenuActions != 0) return true;
+   foreach (ContextMenuStrip menu in activeMenus) if (!menu.IsDisposed && menu.Visible) return true;
+   return false;
   }
 
   // --- Keyboard -------------------------------------------------------------------------
@@ -2094,7 +2068,7 @@ namespace MacDeskNative {
 
    if (pickerMode && keyData == Keys.Enter) {
     string raw = (searchQuery ?? "").Trim().Trim('"');
-    if (raw.Length > 0 && (EntryServices.IsAbsolutePath(raw) || raw.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || raw.StartsWith("https://", StringComparison.OrdinalIgnoreCase))) {
+    if (DeskService.LooksLikeTarget(raw)) {
      bool ok = raw.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? app.TryAddUrl(groupId, raw, -1) : app.TryAddPaths(groupId, new[] { raw }, -1);
      if (ok) { searchQuery = ""; RefreshData(); }
      return true;
@@ -2155,7 +2129,7 @@ namespace MacDeskNative {
   protected override void Dispose(bool disposing) {
    if (disposing) {
     pump.Dispose();
-    if (outsideClickTimer != null) { outsideClickTimer.Stop(); outsideClickTimer.Dispose(); }
+    if (outsideClicks != null) outsideClicks.Dispose();
     foreach (ContextMenuStrip menu in new List<ContextMenuStrip>(activeMenus)) menu.Dispose();
     activeMenus.Clear();
     surface.Dispose();
@@ -2191,7 +2165,8 @@ namespace MacDeskNative {
  internal static class PanelDrawing {
   internal static readonly object Destructive = new object();
   [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
-  static readonly Font MenuFont = Ui.MakeFont(Ui.Cjk, 14f, FontStyle.Regular);
+  const int TextInset = 12, ArrowInset = 24;
+  static readonly Font MenuFont = Ui.MakeFont(Ui.Cjk, 15f, FontStyle.Regular);
 
   internal static void StyleMenu(ContextMenuStrip menu) {
    if (menu == null) return;
@@ -2200,8 +2175,8 @@ namespace MacDeskNative {
    menu.Font = MenuFont;
    menu.Padding = new Padding(6, 6, 6, 6);
    menu.DropShadowEnabled = false; // the legacy square shadow showed as boxes at the rounded corners
-   menu.BackColor = Color.FromArgb(38, 38, 42);
-   menu.ForeColor = Color.White;
+   menu.BackColor = Theme.MenuBackground;
+   menu.ForeColor = Theme.MenuText;
    menu.Renderer = new AppleMenuRenderer();
    menu.ItemAdded += delegate(object s, ToolStripItemEventArgs e) { Pad(e.Item); };
    foreach (ToolStripItem item in menu.Items) Pad(item);
@@ -2209,26 +2184,17 @@ namespace MacDeskNative {
    CloseOnOutsideClick(menu);
   }
 
-  [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
-  static bool ButtonDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
-
   // Our menus open over the desktop / non-activating windows, so the desktop stays the
   // active window and WinForms' "click elsewhere closes the menu" (which relies on our app
   // losing activation) never fires. Watch the buttons ourselves while a menu is open and close
   // it on the first press outside it (or outside any submenu it has open).
   static void CloseOnOutsideClick(ToolStripDropDown menu) {
-   var poll = new Timer { Interval = 10 };
-   bool leftWas = false, rightWas = false;
-   poll.Tick += delegate {
-    if (menu.IsDisposed || !menu.Visible) { poll.Stop(); return; }
-    bool left = ButtonDown(0x01), right = ButtonDown(0x02);
-    bool pressed = (left && !leftWas) || (right && !rightWas);
-    leftWas = left; rightWas = right;
-    if (pressed && !Contains(menu, Control.MousePosition)) menu.Close(ToolStripDropDownCloseReason.AppClicked);
-   };
-   menu.Opened += delegate { leftWas = ButtonDown(0x01); rightWas = ButtonDown(0x02); poll.Start(); };
-   menu.Closed += delegate { poll.Stop(); };
-   menu.Disposed += delegate { poll.Stop(); poll.Dispose(); };
+   var watcher = new OutsideClickWatcher(10);
+   watcher.Paused = () => { if (menu.IsDisposed || !menu.Visible) { watcher.Stop(); return true; } return false; };
+   watcher.Pressed = screen => { if (!Contains(menu, screen)) menu.Close(ToolStripDropDownCloseReason.AppClicked); };
+   menu.Opened += delegate { watcher.Start(); };
+   menu.Closed += delegate { watcher.Stop(); };
+   menu.Disposed += delegate { watcher.Dispose(); };
   }
   static bool Contains(ToolStripDropDown dd, Point screen) {
    if (dd.Visible && dd.Bounds.Contains(screen)) return true;
@@ -2246,14 +2212,14 @@ namespace MacDeskNative {
    dd.Font = MenuFont;
    dd.Padding = new Padding(6, 6, 6, 6);
    dd.DropShadowEnabled = false;
-   dd.BackColor = Color.FromArgb(38, 38, 42);
+   dd.BackColor = Theme.MenuBackground;
    dd.Renderer = new AppleMenuRenderer();
    foreach (ToolStripItem item in dd.Items) Pad(item);
    dd.Opened += delegate { Round(dd); };
   }
   static void Pad(ToolStripItem item) {
    if (item is ToolStripSeparator) { item.Margin = new Padding(0, 3, 0, 3); return; }
-   item.Padding = new Padding(10, 7, 26, 7);
+   item.Padding = new Padding(TextInset, 6, ArrowInset, 6);
    item.Margin = new Padding(0, 1, 0, 1);
   }
   static void Round(ToolStripDropDown dd) {
@@ -2262,7 +2228,7 @@ namespace MacDeskNative {
    try {
     if (dd.IsHandleCreated) {
      int corner = 2; DwmSetWindowAttribute(dd.Handle, 33, ref corner, 4);
-     int border = 0x00504A4A; DwmSetWindowAttribute(dd.Handle, 34, ref border, 4);
+     int border = Theme.WindowBorderColorRef; DwmSetWindowAttribute(dd.Handle, 34, ref border, 4);
     }
    } catch { }
   }
@@ -2270,7 +2236,7 @@ namespace MacDeskNative {
   private sealed class AppleMenuRenderer : ToolStripProfessionalRenderer {
    public AppleMenuRenderer() : base(new MenuColors()) { RoundedEdges = false; }
    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e) {
-    using (var b = new SolidBrush(Color.FromArgb(38, 38, 42))) e.Graphics.FillRectangle(b, e.AffectedBounds);
+    using (var b = new SolidBrush(Theme.MenuBackground)) e.Graphics.FillRectangle(b, e.AffectedBounds);
    }
    // Windows 11 draws the rounded hairline border for DWMWCP_ROUND popups itself.
    protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e) { }
@@ -2278,34 +2244,39 @@ namespace MacDeskNative {
    protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e) {
     if (!e.Item.Selected || !e.Item.Enabled) return;
     var g = e.Graphics;
+    var previous = g.SmoothingMode;
     g.SmoothingMode = SmoothingMode.AntiAlias;
     var r = new RectangleF(1, 0, e.Item.Width - 2, e.Item.Height);
     bool destructive = e.Item.Tag == Destructive;
     using (var path = Ui.Squircle(r, 7))
-    using (var b = new SolidBrush(destructive ? Color.FromArgb(255, 69, 58) : Color.FromArgb(10, 132, 255))) g.FillPath(b, path);
+    using (var b = new SolidBrush(destructive ? Theme.MenuDestructiveHighlight : Theme.MenuHighlight)) g.FillPath(b, path);
+    g.SmoothingMode = previous;
    }
    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
     bool destructive = e.Item.Tag == Destructive;
-    e.TextColor = !e.Item.Enabled ? Color.FromArgb(110, 235, 235, 245) : (e.Item.Selected ? Color.White : (destructive ? Color.FromArgb(255, 105, 97) : Color.FromArgb(245, 245, 250)));
-    base.OnRenderItemText(e);
+    Color color = !e.Item.Enabled ? Theme.MenuDisabledText : (e.Item.Selected ? Color.White : (destructive ? Theme.MenuDestructiveText : Theme.MenuText));
+    var row = new Rectangle(TextInset, 0, Math.Max(0, e.Item.Width - TextInset - ArrowInset), e.Item.Height);
+    TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, row, color, TextFormatFlags.SingleLine |
+     TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.HidePrefix |
+     TextFormatFlags.EndEllipsis | TextFormatFlags.PreserveGraphicsClipping);
    }
    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e) {
     int y = e.Item.Height / 2;
-    using (var pen = new Pen(Color.FromArgb(46, 255, 255, 255))) e.Graphics.DrawLine(pen, 10, y, e.Item.Width - 10, y);
+    using (var pen = new Pen(Theme.MenuSeparator)) e.Graphics.DrawLine(pen, TextInset, y, e.Item.Width - TextInset, y);
    }
    protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) {
-    e.ArrowColor = Color.FromArgb(200, 235, 235, 245);
+    e.ArrowColor = Theme.SecondaryLabel;
     base.OnRenderArrow(e);
    }
   }
   private sealed class MenuColors : ProfessionalColorTable {
-   public override Color ToolStripDropDownBackground { get { return Color.FromArgb(38, 38, 42); } }
+   public override Color ToolStripDropDownBackground { get { return Theme.MenuBackground; } }
    public override Color MenuBorder { get { return Color.FromArgb(70, 70, 76); } }
    public override Color MenuItemBorder { get { return Color.Transparent; } }
-   public override Color MenuItemSelected { get { return Color.FromArgb(10, 132, 255); } }
-   public override Color ImageMarginGradientBegin { get { return Color.FromArgb(38, 38, 42); } }
-   public override Color ImageMarginGradientMiddle { get { return Color.FromArgb(38, 38, 42); } }
-   public override Color ImageMarginGradientEnd { get { return Color.FromArgb(38, 38, 42); } }
+   public override Color MenuItemSelected { get { return Theme.MenuHighlight; } }
+   public override Color ImageMarginGradientBegin { get { return Theme.MenuBackground; } }
+   public override Color ImageMarginGradientMiddle { get { return Theme.MenuBackground; } }
+   public override Color ImageMarginGradientEnd { get { return Theme.MenuBackground; } }
   }
 
   internal static GraphicsPath Rounded(Rectangle rectangle, int radius) {

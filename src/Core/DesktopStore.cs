@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -41,6 +42,7 @@ namespace MacDesk.Core {
     string path = Path.Combine(Root, "desktop.json");
     byte[] b = File.Exists(path) ? File.ReadAllBytes(path) : null;
     DesktopData next = b == null ? new DesktopData() : Serializer().Deserialize<DesktopData>(Encoding.UTF8.GetString(b).TrimStart('\uFEFF'));
+    Migrate(next);
     Validate(next);
     foreach (var group in next.groups)
      foreach (var item in group.items) EntryServices.NormalizeAppShortcut(item);
@@ -48,9 +50,27 @@ namespace MacDesk.Core {
     original = b == null ? null : Hash(b);
    }
   }
+  // Older files are upgraded in memory; the next successful Edit writes the new version.
+  // v1 -> v2: adds an empty reminder list. Notes and folders are unchanged.
+  static void Migrate(DesktopData d) {
+   if (d == null || d.version != 1) return;
+   if (d.todos == null) d.todos = new List<DeskTodo>();
+   d.version = 2;
+  }
+
+  public const int MaxTodos = 5000, MaxTodoTitle = 200;
+
+  /// "yyyy-MM-dd" naming a real calendar date.
+  public static bool IsDateKey(string key) {
+   DateTime parsed;
+   return key != null && Regex.IsMatch(key, @"\A\d{4}-\d{2}-\d{2}\z") &&
+    DateTime.TryParseExact(key, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed);
+  }
+
   public static void Validate(DesktopData d) {
-   if (d == null || d.version != 1 || d.groups == null) throw new InvalidDataException("不支持的桌面数据版本或格式。");
+   if (d == null || d.version != DesktopData.CurrentVersion || d.groups == null) throw new InvalidDataException("不支持的桌面数据版本或格式。");
    if (d.notes == null) d.notes = new Dictionary<string, string>();
+   if (d.todos == null) d.todos = new List<DeskTodo>();
    foreach (var pair in d.notes) {
     if (String.IsNullOrWhiteSpace(pair.Key) || !Regex.IsMatch(pair.Key, @"\A\d{4}-\d{2}-\d{2}\z"))
      throw new InvalidDataException("日历备忘日期格式无效。");
@@ -72,6 +92,18 @@ namespace MacDesk.Core {
      if (!String.IsNullOrEmpty(i.icon) && !Path.IsPathRooted(i.icon)) throw new InvalidDataException("图标必须是完整路径。");
      if (i.arguments != null && i.arguments.IndexOf('\0') >= 0) throw new InvalidDataException("启动参数包含无效字符。");
     }
+   }
+   if (d.todos.Count > MaxTodos) throw new InvalidDataException("待办数量过多。");
+   foreach (var t in d.todos) {
+    if (t == null) throw new InvalidDataException("待办为空。");
+    CheckId(t.id, ids);
+    if (String.IsNullOrWhiteSpace(t.title)) throw new InvalidDataException("待办内容不能为空。");
+    if (t.title.Length > MaxTodoTitle) throw new InvalidDataException("待办内容不能超过 " + MaxTodoTitle + " 个字。");
+    if (t.title.IndexOfAny(new char[] { '\0', '\r', '\n' }) >= 0) throw new InvalidDataException("待办内容不能包含换行或控制字符。");
+    if (t.due == null) t.due = "";
+    if (t.created == null) t.created = "";
+    if (t.completed == null) t.completed = "";
+    if (t.due.Length > 0 && !IsDateKey(t.due)) throw new InvalidDataException("待办日期格式无效。");
    }
   }
   static void CheckId(string id, HashSet<string> ids) { if (id == null || !Regex.IsMatch(id, @"\A[A-Za-z0-9_-]+\z") || !ids.Add(id)) throw new InvalidDataException("ID无效或重复。"); }
@@ -96,6 +128,7 @@ namespace MacDesk.Core {
         string backup = Path.Combine(backups, "data-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fffffff") + "-" + Guid.NewGuid().ToString("N") + ".json");
         File.WriteAllBytes(backup, old);
         File.Replace(temp, path, null);
+        try { PruneBackups(backups, DateTime.Now); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex); }
        }
       } else {
        if (original != null) throw new IOException("原配置已被删除，请重新加载。");
@@ -106,6 +139,36 @@ namespace MacDesk.Core {
      } finally { if (File.Exists(temp)) File.Delete(temp); }
     }
    }
+  }
+
+  public const int KeepRecentBackups = 50, KeepDailyBackupDays = 30;
+
+  /// Keeps the newest KeepRecentBackups backups, plus the newest backup of each of the last
+  /// KeepDailyBackupDays days; deletes the rest. Names are "data-yyyyMMdd-HHmmss-fffffff-<guid>.json",
+  /// so ordinal order is time order. Files that do not follow the pattern are never touched.
+  internal static void PruneBackups(string directory, DateTime now) {
+   if (!Directory.Exists(directory)) return;
+   var files = new List<string>();
+   foreach (string file in Directory.GetFiles(directory, "data-*.json")) {
+    DateTime day;
+    if (TryBackupDay(Path.GetFileName(file), out day)) files.Add(file);
+   }
+   files.Sort((a, b) => String.CompareOrdinal(Path.GetFileName(b), Path.GetFileName(a)));
+   var days = new HashSet<DateTime>();
+   for (int i = 0; i < files.Count; i++) {
+    DateTime day;
+    TryBackupDay(Path.GetFileName(files[i]), out day);
+    bool keep = i < KeepRecentBackups || ((now.Date - day).TotalDays < KeepDailyBackupDays && !days.Contains(day));
+    days.Add(day);
+    if (keep) continue;
+    try { File.Delete(files[i]); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+   }
+  }
+
+  static bool TryBackupDay(string name, out DateTime day) {
+   day = DateTime.MinValue;
+   return name.Length > 13 && name.StartsWith("data-", StringComparison.Ordinal) &&
+    DateTime.TryParseExact(name.Substring(5, 8), "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out day);
   }
  }
 }
