@@ -25,7 +25,7 @@ namespace MacDeskNative {
    public bool Lingering;
    public double Left;
    public bool Placed;
-   public bool Step(double dt) { return Y.Step(dt) | Check.Step(dt) | Fade.Step(dt); }
+   public bool Step(double dt) { return Y.StepChanged(dt) | Check.StepChanged(dt) | Fade.StepChanged(dt); }
   }
 
   readonly AppController app;
@@ -54,36 +54,36 @@ namespace MacDeskNative {
   /// Rebuilds the list from the data (animate: existing rows glide, new ones fade in).
   public void Refresh(bool animate) {
    todayKey = Reminders.TodayKey();
-   var agenda = TodoQueries.Agenda(app.Data, todayKey);
-   var previous = new List<Item>(rows);
-   var keep = new List<Item>();
+   var data = app.Data;
+   var agenda = TodoQueries.AgendaPreview(data, todayKey, t => !app.IsTodoDone(t), MaxRows, out openCount);
+   var keep = new List<Item>(MaxRows * 2);
    // Everything follows the agenda, except reminders ticked here: they hold their old slot
    // until they have faded out.
    foreach (var entry in agenda) {
     Item item;
-    if (!items.TryGetValue(entry.Todo.id, out item)) { item = new Item(); items[entry.Todo.id] = item; }
+    if (!items.TryGetValue(entry.Todo.id, out item)) item = new Item();
     item.Todo = entry.Todo;
-    if (app.IsTodoDone(entry.Todo) && !item.Lingering) continue; // ticked, save still pending
+    if (item.Lingering) { item.Lingering = false; item.Fade.Target = 1; }
     item.Trailing = entry.Section == TodoQueries.AgendaSection.Overdue ? Reminders.RelativeDay(entry.Todo.due, todayKey) : null;
-    if (!(item.Lingering && previous.Contains(item))) keep.Add(item);
+    keep.Add(item);
    }
-   for (int i = 0; i < previous.Count; i++) {
-    var r = previous[i];
-    if (!r.Lingering || keep.Contains(r)) continue;
-    var current = app.Data.todos.Find(t => t.id == r.Todo.id);
-    if (current == null) continue;
+   int lingeringCount = 0;
+   for (int i = 0; i < rows.Count; i++) {
+    var r = rows[i];
+    if (!r.Lingering) continue;
+    var current = data.todos.Find(t => t.id == r.Todo.id);
+    if (current == null || !app.IsTodoDone(current)) continue;
     r.Todo = current;
     keep.Insert(Math.Min(i, keep.Count), r);
+    lingeringCount++;
    }
-   openCount = 0;
-   foreach (var entry in agenda) if (!app.IsTodoDone(entry.Todo)) openCount++;
    rows.Clear();
+   items.Clear();
    for (int i = 0; i < keep.Count && i < MaxRows; i++) rows.Add(keep[i]);
-   overflow = Math.Max(0, keep.Count - rows.Count);
-   var alive = new HashSet<string>();
+   overflow = Math.Max(0, openCount + lingeringCount - rows.Count);
    for (int i = 0; i < rows.Count; i++) {
     var it = rows[i];
-    alive.Add(it.Todo.id);
+    items.Add(it.Todo.id, it);
     float target = i * RowH;
     if (!it.Placed) {
      it.Y.Snap(target);
@@ -97,14 +97,14 @@ namespace MacDeskNative {
     }
     it.Check.Target = app.IsTodoDone(it.Todo) ? 1 : 0;
    }
-   foreach (var id in new List<string>(items.Keys)) if (!alive.Contains(id)) items.Remove(id);
   }
 
   /// True when the Beijing date has rolled over since the last Refresh.
   public bool DayChanged { get { return todayKey != Reminders.TodayKey(); } }
 
-  public bool Step(double dt) {
-   bool moving = plusPress.Step(dt);
+  public bool Step(double dt, out bool waiting) {
+   bool moving = plusPress.StepChanged(dt);
+   waiting = false;
    bool rebuild = false;
    foreach (var it in rows) {
     moving |= it.Step(dt);
@@ -113,10 +113,10 @@ namespace MacDeskNative {
     it.Left -= dt;
     if (before > 0 && it.Left <= 0) it.Fade.Target = 0;                    // start fading out
     if (it.Left <= -FadeSeconds) { it.Lingering = false; rebuild = true; } // gone: close the gap
-    moving = true;
+    else waiting = true;
    }
    if (rebuild) Refresh(true);
-   return moving;
+   return moving || rebuild;
   }
 
   // ---- Input (host client coordinates) ----------------------------------------------------

@@ -25,12 +25,9 @@ namespace MacDeskNative {
   const float CardRadius = 26f;
   const int GridLeft = 22, GridTop = 306, CellW = 44, CellH = 34;
 
-  TextureBrush wallpaperBrush;
-  Backdrop wallpaperSource;
-  Point wallpaperOrigin;
-  Rectangle wallpaperRegion;
+  readonly DesktopGlassBrush wallpaperGlass = new DesktopGlassBrush(0.30f, Material.WidgetTint);
 
-  bool rendering, draggingCard;
+  bool rendering, draggingCard, frameRequested;
   Point mouseClient = new Point(-999, -999);
   Point dragDownScreen, dragOrigLoc, dragTargetLocation;
   enum CalendarTarget { None, PreviousMonth, NextMonth, Today, Day, Widget }
@@ -180,6 +177,12 @@ namespace MacDeskNative {
    Wake();
   }
 
+  internal void RefreshReminderPreview() {
+   if (IsDisposed || Disposing) return;
+   todos.Refresh(IsHandleCreated && Visible);
+   Wake();
+  }
+
   void ChangeMonth(int delta) {
    if (delta == 0) return;
    monthOffset += delta;
@@ -193,7 +196,10 @@ namespace MacDeskNative {
 
   // --- Animation & rendering ------------------------------------------------------------
 
-  void Wake() { if (!IsDisposed && IsHandleCreated) pump.Start(); }
+  void Wake() {
+   frameRequested = true;
+   if (!IsDisposed && IsHandleCreated) pump.Start();
+  }
 
   // Offscreen benchmark: hover across calendar days, flip months, then drag the widgets.
   internal Bench.Stat[] Bench() {
@@ -218,7 +224,7 @@ namespace MacDeskNative {
    var widget = MacDeskNative.Bench.Time("reminders widget hover", 240, delegate {
     RectangleF r = todos.RowRect((k++ / 12) % Math.Max(1, todos.VisibleRows));
     var at = Point.Round(new PointF(r.X + 150, r.Y + r.Height / 2));
-    todos.MouseMove(at);
+    frameRequested |= todos.MouseMove(at);
     mouseClient = at;
     Tick(1 / 240.0);
    });
@@ -257,39 +263,17 @@ namespace MacDeskNative {
    }
    bool active = false;
    monthHover.Target = MonthCard.Contains(mouseClient) ? 1 : 0;
-   if (dayHoverTarget != hoveredDay) { dayHoverTarget = hoveredDay; dayHover.Snap(0); }
+   if (dayHoverTarget != hoveredDay) { dayHoverTarget = hoveredDay; dayHover.Snap(0); frameRequested = true; }
    dayHover.Target = hoveredDay > 0 ? 1 : 0;
    navPress.Target = pressedTarget == CalendarTarget.PreviousMonth || pressedTarget == CalendarTarget.NextMonth ? 0.88 : 1;
-   active |= monthHover.Step(dt);
-   active |= monthSlide.Step(dt);
-   active |= dayHover.Step(dt);
-   active |= navPress.Step(dt);
-   active |= todos.Step(dt);
-   Render();
-   return active;
-  }
-
-  TextureBrush WallpaperBrush() {
-   Backdrop bd = Wallpaper.Current;
-   if (bd == null) return null;
-   Point origin = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
-   Rectangle region = Rectangle.Inflate(Rectangle.Union(ClockCard, TodoCard), 4, 4);
-   region.Offset(origin);
-   region.Intersect(bd.Area);
-   if (region.Width <= 0 || region.Height <= 0) return null;
-   if (wallpaperBrush == null || wallpaperSource != bd || !wallpaperRegion.Contains(region)) {
-    if (wallpaperBrush != null) wallpaperBrush.Dispose();
-    wallpaperRegion = Rectangle.Intersect(Rectangle.Inflate(region, 96, 96), bd.Area);
-    wallpaperBrush = bd.CreateBrush(wallpaperRegion, origin);
-    wallpaperSource = bd;
-    wallpaperOrigin = new Point(int.MinValue, 0);
-   }
-   if (wallpaperOrigin != origin) {
-    wallpaperBrush.ResetTransform();
-    wallpaperBrush.TranslateTransform(wallpaperRegion.X - origin.X, wallpaperRegion.Y - origin.Y);
-    wallpaperOrigin = origin;
-   }
-   return wallpaperBrush;
+   active |= monthHover.StepChanged(dt);
+   active |= monthSlide.StepChanged(dt);
+   active |= dayHover.StepChanged(dt);
+   active |= navPress.StepChanged(dt);
+   bool waiting;
+   active |= todos.Step(dt, out waiting);
+   if (active || frameRequested) { frameRequested = false; Render(); }
+   return active || waiting;
   }
 
   void OnWallpaperChanged(object sender, EventArgs e) {
@@ -304,6 +288,7 @@ namespace MacDeskNative {
   string footerKey;
   Point cardsOrigin;
   Backdrop cardsSource;
+  bool cardsWhileDragging;
   DateTime headerMonth, gridToday;
   readonly System.Drawing.Imaging.ImageAttributes blitAttributes = new System.Drawing.Imaging.ImageAttributes();
   readonly System.Drawing.Imaging.ColorMatrix blitMatrix = new System.Drawing.Imaging.ColorMatrix();
@@ -319,7 +304,7 @@ namespace MacDeskNative {
   }
   static void Replace(ref Bitmap cache, Bitmap next) { if (cache != null) cache.Dispose(); cache = next; }
 
-  void DrawCard(Graphics g, Rectangle bounds) {
+  void DrawCard(Graphics g, Rectangle bounds, TextureBrush glass) {
    var r = new RectangleF(bounds.X, bounds.Y, bounds.Width, bounds.Height);
    for (int i = 0; i < 3; i++) {
     float spread = 2f + i * 3f;
@@ -327,15 +312,15 @@ namespace MacDeskNative {
     using (var path = Ui.Squircle(s, CardRadius + spread * 0.5f))
     using (var b = new SolidBrush(Color.FromArgb(14 - i * 3, 0, 0, 0))) g.FillPath(b, path);
    }
-   using (var shape = Ui.Squircle(r, CardRadius)) Material.Fill(g, shape, WallpaperBrush(), Material.WidgetTint, Material.WidgetFallback);
+   using (var shape = Ui.Squircle(r, CardRadius)) Material.Fill(g, shape, glass, Color.Transparent, Material.WidgetTint);
    Material.Rim(g, r, CardRadius, 0.7f);
   }
 
   static readonly string[] WeekLetters = { "日", "一", "二", "三", "四", "五", "六" };
-  void DrawStaticCards(Graphics g) {
-   DrawCard(g, ClockCard);
-   DrawCard(g, MonthCard);
-   DrawCard(g, TodoCard);
+  void DrawStaticCards(Graphics g, TextureBrush glass) {
+   DrawCard(g, ClockCard, glass);
+   DrawCard(g, MonthCard, glass);
+   DrawCard(g, TodoCard, glass);
    using (var f = Ui.Centered(false))
     for (int c = 0; c < 7; c++)
      using (var b = new SolidBrush(c == 0 || c == 6 ? Ui.TertiaryLabel : Ui.SecondaryLabel))
@@ -343,14 +328,21 @@ namespace MacDeskNative {
   }
 
   void DrawCards(Graphics g) {
-   Backdrop bd = Wallpaper.Current;
-   Point origin = PointToScreen(Point.Empty);
-   if (cardsCache == null || cardsCache.Size != Size || cardsOrigin != origin || cardsSource != bd) {
-    Graphics cg;
-    Replace(ref cardsCache, Layer(new Rectangle(Point.Empty, Size), out cg));
-    using (cg) DrawStaticCards(cg);
+   // While carried, let the compositor show the desktop through a reusable alpha layer.
+   // Rebuild the aligned frost once after landing, outside the pointer-move path.
+   Backdrop bd = draggingCard ? null : Wallpaper.Current;
+   Point origin = draggingCard ? Point.Empty : PointToScreen(Point.Empty);
+   if (cardsCache == null || cardsCache.Size != Size || cardsOrigin != origin || cardsSource != bd || cardsWhileDragging != draggingCard) {
+    if (cardsCache == null || cardsCache.Size != Size)
+     Replace(ref cardsCache, new Bitmap(Width, Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb));
+    using (var cg = Graphics.FromImage(cardsCache)) {
+     cg.Clear(Color.Transparent);
+     Ui.PrepareQuality(cg);
+     DrawStaticCards(cg, draggingCard ? null : wallpaperGlass.At(bd, origin));
+    }
     cardsOrigin = origin;
     cardsSource = bd;
+    cardsWhileDragging = draggingCard;
    }
    var mode = g.CompositingMode;
    g.CompositingMode = CompositingMode.SourceCopy;
@@ -359,7 +351,7 @@ namespace MacDeskNative {
   }
 
   void Render() {
-   if (IsDisposed || Disposing || rendering || draggingCard || !IsHandleCreated || Width < 1 || Height < 1) return;
+   if (IsDisposed || Disposing || rendering || !IsHandleCreated || Width < 1 || Height < 1) return;
    rendering = true;
    try {
     DateTime utc = DateTime.UtcNow, now = BeijingFromUtc(utc);
@@ -644,9 +636,11 @@ namespace MacDeskNative {
   }
 
   void ApplyDragTarget() {
-   // DWM can move the existing layered bitmap without asking us to paint it again.
    Point target = ClampLocation(dragTargetLocation);
-   if (Location != target) Location = target;
+   if (Location == target) return;
+   EnsureZOrder();
+   Location = target;
+   if (!cardsWhileDragging) Render();
   }
 
   void FinishDrag(Point? releaseScreen) {
@@ -723,7 +717,7 @@ namespace MacDeskNative {
     pump.Dispose();
     timer.Dispose();
     surface.Dispose();
-    if (wallpaperBrush != null) { wallpaperBrush.Dispose(); wallpaperBrush = null; }
+    wallpaperGlass.Dispose();
     chevronFont.Dispose();
     todos.Dispose();
     blitAttributes.Dispose();

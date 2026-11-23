@@ -66,6 +66,8 @@ namespace MacDeskNative {
   readonly Spring openSpring = new Spring(0, Theme.PopupOpenResponse, Theme.PopupOpenDamping);
   readonly Spring closeSpring = new Spring(0, Theme.PopupCloseResponse, Theme.PopupCloseDamping);
   bool closing, contentDirty = true;
+  float presentedScale;
+  byte presentedAlpha;
   Size cardSize;
   PointF pivot;
   Bitmap chrome, content;
@@ -74,6 +76,7 @@ namespace MacDeskNative {
   Backdrop glass;
   TextureBrush glassBrush;
   Point glassBrushOrigin;
+  Rectangle glassBrushRegion;
   Point mouseCard = new Point(-999, -999);
 
   protected GlassPopup(AppController app) {
@@ -119,6 +122,7 @@ namespace MacDeskNative {
   protected abstract void DrawCard(Graphics g);
   /// Per-frame content animation; return true while something still moves.
   protected virtual bool StepCard(double dt) { return false; }
+  protected virtual bool CardHasPendingWork { get { return false; } }
   protected virtual void OnOutsidePress(Point screen) { Dismiss(); }
   /// Close when another program takes the foreground (toasts stay for their few seconds).
   protected virtual bool FollowsForeground { get { return true; } }
@@ -143,7 +147,8 @@ namespace MacDeskNative {
   public Rectangle CardScreenRect { get { return new Rectangle(Left + ShadowPad, Top + ShadowPad, cardSize.Width, cardSize.Height); } }
   /// Open progress: 0 = at the anchor, 1 = landed (springs may overshoot slightly).
   protected double Progress { get { return closing ? closeSpring.Value : openSpring.Value; } }
-  bool Interactive { get { return IsOpen && openSpring.Value > 0.85; } }
+  // Input is taken while the card is still growing (the spring is only motion).
+  bool Interactive { get { return IsOpen; } }
 
   /// Card coordinates -> screen.
   protected Point CardToScreen(PointF p) { return new Point(Left + ShadowPad + (int)Math.Round(p.X), Top + ShadowPad + (int)Math.Round(p.Y)); }
@@ -157,6 +162,7 @@ namespace MacDeskNative {
   /// an area covering every place the card may move or grow to while it stays open.
   protected void CaptureGlass(Rectangle area) {
    ReleaseGlass();
+   chromeSize = Size.Empty;
    if (area.Width < 1 || area.Height < 1) return;
    try {
     using (Bitmap shot = Backdrop.CaptureScreen(area)) glass = Backdrop.FromImage(shot, area);
@@ -170,12 +176,16 @@ namespace MacDeskNative {
 
   TextureBrush GlassBrush(Point cardOrigin) {
    if (glass == null) return null;
-   if (glassBrush == null) {
-    glassBrush = glass.CreateBrush(glass.Area, cardOrigin);
+   var region = Rectangle.Intersect(new Rectangle(cardOrigin, cardSize), glass.Area);
+   if (region.Width <= 0 || region.Height <= 0) return null;
+   if (glassBrush == null || !glassBrushRegion.Contains(region)) {
+    if (glassBrush != null) glassBrush.Dispose();
+    glassBrushRegion = region;
+    glassBrush = glass.CreateBrush(region, cardOrigin);
     glassBrushOrigin = cardOrigin;
    } else if (glassBrushOrigin != cardOrigin) {
     glassBrush.ResetTransform();
-    glassBrush.TranslateTransform(glass.Area.X - cardOrigin.X, glass.Area.Y - cardOrigin.Y);
+    glassBrush.TranslateTransform(glassBrushRegion.X - cardOrigin.X, glassBrushRegion.Y - cardOrigin.Y);
     glassBrushOrigin = cardOrigin;
    }
    return glassBrush;
@@ -185,7 +195,7 @@ namespace MacDeskNative {
 
   /// Shows the card at `card` (screen rectangle of the glass), growing out of `anchor`, or moves
   /// / resizes it if it is already open. Call CaptureGlass first when it is not yet visible.
-  protected void PresentCard(Rectangle card, RectangleF anchor) {
+  protected void PresentCard(Rectangle card, RectangleF anchor, bool drawNow = true) {
    if (IsDisposed) return;
    cardSize = card.Size;
    var window = Rectangle.Inflate(card, ShadowPad, ShadowPad);
@@ -213,7 +223,7 @@ namespace MacDeskNative {
     if (Bounds != window) Bounds = window;
    }
    app.BringPopupToTop(this);
-   Render();
+   if (drawNow) Render();
    pump.Start();
   }
 
@@ -244,6 +254,7 @@ namespace MacDeskNative {
    Hide();
    app.UnregisterPopup(this);
    ReleaseGlass();
+   presentedScale = 0;
    closing = false;
    mouseCard = new Point(-999, -999);
    OnDismissed();
@@ -257,23 +268,33 @@ namespace MacDeskNative {
   // ---- Frames ---------------------------------------------------------------------------
 
   bool Tick(double dt) {
+   double previousProgress = Progress;
    bool moving = closing ? closeSpring.Step(dt) : openSpring.Step(dt);
    bool content = StepCard(dt);
    if (content) contentDirty = true;
    if (closing && (closeSpring.Settled || closeSpring.Value < 0.015)) { FinishClose(); return false; }
-   Render();
-   return moving || content;
+   if (contentDirty || Progress != previousProgress) Render();
+   return moving || content || CardHasPendingWork;
   }
 
   void Render() {
    if (IsDisposed || !IsHandleCreated || cardSize.Width < 1 || cardSize.Height < 1) return;
    Size window = new Size(cardSize.Width + ShadowPad * 2, cardSize.Height + ShadowPad * 2);
-   if (contentDirty || content == null || content.Size != window) RenderContent(window);
+   bool redraw = contentDirty || content == null || content.Size != window;
+   if (redraw) RenderContent(window);
    double p = Math.Max(0, Math.Min(1.04, Progress));
    float scale = (float)(StartScale + (1 - StartScale) * p);
-   float alpha = (float)Math.Max(0, Math.Min(1, p * 1.7));
+   if (Math.Abs(scale - 1) < 0.0015f) scale = 1;
+   byte alpha = (byte)Math.Round(Math.Min(1, p * 1.7) * 255);
+   if (!redraw && scale == presentedScale) {
+    if (alpha != presentedAlpha) {
+     surface.Present(Handle, null, alpha, null);
+     presentedAlpha = alpha;
+    }
+    return;
+   }
    var g = surface.Begin(window);
-   if (Math.Abs(scale - 1) < 0.0015f) {
+   if (scale == 1) {
     // Landed: a 1:1 copy (whole pixels, no resampling).
     var mode = g.CompositingMode;
     g.CompositingMode = CompositingMode.SourceCopy;
@@ -301,7 +322,9 @@ namespace MacDeskNative {
     g.InterpolationMode = im;
    }
    // The fade is the layered window's constant alpha: free, no per-pixel work.
-   surface.Present(Handle, Location, (byte)Math.Round(alpha * 255), null);
+   surface.Present(Handle, Location, alpha, null);
+   presentedScale = scale;
+   presentedAlpha = alpha;
   }
 
   void RenderContent(Size window) {

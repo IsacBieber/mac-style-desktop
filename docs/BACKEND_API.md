@@ -96,7 +96,7 @@ DeskTodo    { id, title, done, due: ""|"yyyy-MM-dd", created, completed }   // �
 
 ### 线程
 
-只从 UI 线程调用。`Changed` 在调用线程上同步触发。`DiscoverApps` / `GetIcon` / `LoadIcon` / `OpenAppOnWorker` 可以在后台线程调用。
+MacDesk 在后台按顺序保存提醒事项和日历备注。存储层串行提交，并在保存成功后发布只读数据快照。`Changed` 在调用线程上同步触发，界面收到后台事件后回到 UI 线程刷新。其他界面操作仍从 UI 线程调用。`DiscoverApps` / `GetIcon` / `LoadIcon` / `OpenAppOnWorker` 也可以在后台线程调用。
 
 ## 新增一个后端能力的步骤
 

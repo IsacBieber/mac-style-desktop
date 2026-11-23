@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 using MacDesk.Core;
 
@@ -60,7 +61,7 @@ namespace MacDeskNative
         private static IntPtr shellRoot;
         private static IntPtr hiddenIconList, iconView;
         private const int WindowStyle = -16, VisibleStyle = 0x10000000;
-        private const int HideWindow = 0, ShowNoActivate = 8;
+        private const int HideWindow = 0;
 
         private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
 
@@ -131,10 +132,30 @@ namespace MacDeskNative
         internal static void RestoreDesktopIcons()
         {
             IntPtr list = hiddenIconList;
+            if (IsIconList(iconView, list) && !ShowIconList(list))
+                return; // Keep the handle so desktop host disposal can retry after the app closes.
+
             hiddenIconList = IntPtr.Zero;
-            if (IsIconList(iconView, list))
-                ShowWindowAsync(list, ShowNoActivate);
             iconView = IntPtr.Zero;
+        }
+
+        private static bool ShowIconList(IntPtr list)
+        {
+            if ((GetWindowStyle(list, WindowStyle) & VisibleStyle) != 0)
+                return true;
+
+            // ASYNCWINDOWPOS | SHOWWINDOW | NOOWNERZORDER | NOACTIVATE | NOZORDER | NOMOVE | NOSIZE
+            const uint flags = 0x4000 | 0x0040 | 0x0200 | 0x0010 | 0x0004 | 0x0002 | 0x0001;
+            if (!SetWindowPos(list, IntPtr.Zero, 0, 0, 0, 0, flags))
+                return false;
+            // A queued request can succeed before Explorer actually shows the view.
+            for (int i = 0; i < 10; i++)
+            {
+                if ((GetWindowStyle(list, WindowStyle) & VisibleStyle) != 0)
+                    return true;
+                Thread.Sleep(15);
+            }
+            return (GetWindowStyle(list, WindowStyle) & VisibleStyle) != 0;
         }
 
         private static bool IsIconList(IntPtr view, IntPtr list)
@@ -444,6 +465,7 @@ namespace MacDeskNative
                 if (GetCurrentThreadId() != thread)
                     throw new InvalidOperationException("Desktop host scope must be disposed on its creating UI thread, after all App windows are destroyed.");
 
+                RestoreDesktopIcons();
                 Parent = IntPtr.Zero;
                 shellWindow = shellRoot = IntPtr.Zero;
                 shellPid = 0;

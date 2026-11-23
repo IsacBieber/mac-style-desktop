@@ -24,6 +24,7 @@ namespace MacDeskNative {
 
   NotifyIcon tray;
   bool closing, refreshQueued, testMode;
+  readonly int uiThread = Thread.CurrentThread.ManagedThreadId;
   readonly HashSet<string> launchingApps = new HashSet<string>();
   int panelSession;
   BackdropOverlay dim;
@@ -197,7 +198,11 @@ namespace MacDeskNative {
    testMode = !show;
    try {
     Service = new DeskService(root);
-    Service.Changed += delegate(object sender, EventArgs e) { QueueRefresh(DeskChangedEventArgs.KindsOf(e)); };
+    Service.Changed += delegate(object sender, EventArgs e) {
+     DeskChange kinds = DeskChangedEventArgs.KindsOf(e);
+     if (Thread.CurrentThread.ManagedThreadId == uiThread) QueueRefresh(kinds);
+     else PostReminderUi(() => QueueRefresh(kinds));
+    };
     if (seedIfEmpty) Service.SeedStarterGroupsIfNew();
     // Desktop folders are laid out by order on a fixed grid (like a phone home screen);
     // turn any free positions saved by older versions into that order, once.
@@ -277,21 +282,49 @@ namespace MacDeskNative {
   }
 
   // ---- Reminders -----------------------------------------------------------------------------
-  // Ticking a reminder animates at once; the save waits until the views have settled (a disk
-  // write mid-animation would drop frames), and quick successive ticks are saved together.
+  // Rapid ticks are coalesced, and all reminder writes run in order off the UI thread.
 
-  readonly Dictionary<string, bool> pendingDone = new Dictionary<string, bool>();
+  sealed class TodoTick {
+   public readonly bool Done;
+   public bool Queued;
+   public TodoTick(bool done) { Done = done; }
+  }
+  readonly Dictionary<string, TodoTick> pendingDone = new Dictionary<string, TodoTick>();
   System.Windows.Forms.Timer doneFlush;
+  Task reminderWrites;
+
+  void PostReminderUi(Action update) {
+   try { Home.BeginInvoke((Action)delegate { if (!closing && !Home.IsDisposed) update(); }); }
+   catch (InvalidOperationException) { } // Home already closed.
+  }
+
+  internal void SaveReminder(Action<DeskService> write, Action<Exception> completed = null) {
+   if (testMode) {
+    write(Service);
+    if (completed != null) completed(null);
+    return;
+   }
+   Action save = delegate {
+    Exception error = null;
+    try { write(Service); } catch (Exception ex) { error = ex; Debug.WriteLine(ex); }
+    if (error != null || completed != null) PostReminderUi(delegate {
+     if (completed != null) completed(error);
+     if (error != null) Fail(error);
+    });
+   };
+   reminderWrites = reminderWrites == null ? Task.Factory.StartNew(save, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default) :
+    reminderWrites.ContinueWith(delegate { save(); }, TaskScheduler.Default);
+  }
 
   /// What a view should show for `todo` (a pending tick wins over the saved state).
   internal bool IsTodoDone(DeskTodo todo) {
-   bool done;
-   return todo != null && (pendingDone.TryGetValue(todo.id, out done) ? done : todo.done);
+   TodoTick tick;
+   return todo != null && (pendingDone.TryGetValue(todo.id, out tick) ? tick.Done : todo.done);
   }
   internal bool HasPendingTicks { get { return pendingDone.Count > 0; } }
 
   internal void ToggleTodoSoon(string todoId, bool done) {
-   pendingDone[todoId] = done;
+   pendingDone[todoId] = new TodoTick(done);
    if (testMode) { FlushTodoTicks(); return; }
    if (doneFlush == null) {
     doneFlush = new System.Windows.Forms.Timer { Interval = 520 };
@@ -299,15 +332,28 @@ namespace MacDeskNative {
    }
    doneFlush.Stop();
    doneFlush.Start();
-   if (Home != null && !Home.IsDisposed) Home.RefreshData();
+   if (Home != null && !Home.IsDisposed) Home.RefreshReminderPreview();
   }
 
   internal void FlushTodoTicks() {
    if (doneFlush != null) doneFlush.Stop();
    if (pendingDone.Count == 0) return;
-   var states = new Dictionary<string, bool>(pendingDone);
-   pendingDone.Clear();
-   Try(delegate { Service.SetTodosDone(states); });
+   var batch = new Dictionary<string, TodoTick>();
+   var states = new Dictionary<string, bool>();
+   foreach (var pair in pendingDone) {
+    if (pair.Value.Queued) continue;
+    pair.Value.Queued = true;
+    batch.Add(pair.Key, pair.Value);
+    states.Add(pair.Key, pair.Value.Done);
+   }
+   if (batch.Count == 0) return;
+   SaveReminder(service => service.SetTodosDone(states), delegate {
+    foreach (var pair in batch) {
+     TodoTick latest;
+     if (pendingDone.TryGetValue(pair.Key, out latest) && latest == pair.Value) pendingDone.Remove(pair.Key);
+    }
+    QueueRefresh(DeskChange.Todos);
+   });
   }
 
   public DeskTodo AddTodo(string title, string dueDateKey) {
@@ -399,7 +445,7 @@ namespace MacDeskNative {
     pendingChanges = DeskChange.None;
     if (closing || Home == null || Home.IsDisposed) return;
     if ((changed & (DeskChange.Notes | DeskChange.Todos | DeskChange.Prefs)) != 0) {
-     Home.RefreshData();
+     Home.RefreshReminderPreview();
      if (daySheet != null && !daySheet.IsDisposed) daySheet.RefreshData();
     }
     if ((changed & (DeskChange.Groups | DeskChange.Prefs)) == 0) return;
@@ -627,6 +673,7 @@ namespace MacDeskNative {
    closing = true;
    try {
     FlushTodoTicks();
+    if (reminderWrites != null) reminderWrites.GetAwaiter().GetResult();
     if (doneFlush != null) doneFlush.Dispose();
     foreach (var popup in new List<GlassPopup>(popups)) popup.DismissNow();
     if (daySheet != null) daySheet.Dispose();

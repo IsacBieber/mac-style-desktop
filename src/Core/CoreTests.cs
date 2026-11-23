@@ -138,6 +138,11 @@ namespace MacDesk.Core {
    svc.SetTodoDone(t2.id, false);
    Check(!svc.FindTodo(t2.id).done && svc.FindTodo(t2.id).completed == "", "reopening clears the stamp");
 
+   int openCount;
+   var preview = TodoQueries.AgendaPreview(svc.Data, "2026-11-23", t => !t.done, 4, out openCount);
+   Check(openCount == 5 && preview.Count == 4 && preview[0].Todo.id == t4.id && preview[1].Todo.id == t1.id &&
+    preview[2].Todo.id == t2.id && preview[3].Todo.id == t5.id, "widget preview keeps agenda priority and stable order under a row limit");
+
    before = saves;
    svc.SetTodosDone(new System.Collections.Generic.Dictionary<string, bool> { { t1.id, true }, { t5.id, true }, { "gone", true } });
    Check(saves == before + 1 && svc.FindTodo(t1.id).done && svc.FindTodo(t5.id).done, "batched ticks save once and skip deleted reminders");

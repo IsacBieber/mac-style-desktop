@@ -182,6 +182,10 @@ namespace MacDeskNative {
    if (Settled) { Value = Target; Velocity = 0; return false; }
    return true;
   }
+  public bool StepChanged(double dt) {
+   double previous = Value;
+   return Step(dt) || Value != previous;
+  }
   public float F { get { return (float)Value; } }
 
   // Closed-form step response (0 -> 1) for time-based motions.
@@ -666,6 +670,50 @@ namespace MacDeskNative {
     }
    }
    return result;
+  }
+ }
+
+ // Uses the shared, already blurred wallpaper as a screen-aligned translucent texture.
+ // Window movement changes only the brush transform, never the underlying image.
+ internal sealed class DesktopGlassBrush : IDisposable {
+  readonly float opacity;
+  readonly Color tint;
+  Backdrop source;
+  TextureBrush brush;
+  Point alignedOrigin;
+
+  internal DesktopGlassBrush(float opacity, Color tint) { this.opacity = opacity; this.tint = tint; }
+
+  internal TextureBrush At(Backdrop wallpaper, Point origin) {
+   if (wallpaper != source) {
+    Dispose();
+    source = wallpaper;
+    if (source != null) {
+     using (var pixels = new Bitmap(source.Image.Width, source.Image.Height, PixelFormat.Format32bppPArgb))
+     using (var g = Graphics.FromImage(pixels))
+     using (var alpha = new ImageAttributes()) {
+      alpha.SetColorMatrix(new ColorMatrix { Matrix33 = opacity });
+      g.CompositingMode = CompositingMode.SourceCopy;
+      g.DrawImage(source.Image, new Rectangle(Point.Empty, pixels.Size), 0, 0, pixels.Width, pixels.Height, GraphicsUnit.Pixel, alpha);
+      g.CompositingMode = CompositingMode.SourceOver;
+      using (var overlay = new SolidBrush(tint)) g.FillRectangle(overlay, 0, 0, pixels.Width, pixels.Height);
+      brush = new TextureBrush(pixels, WrapMode.Clamp);
+     }
+     alignedOrigin = new Point(int.MinValue, int.MinValue);
+    }
+   }
+   if (brush != null && alignedOrigin != origin) {
+    brush.ResetTransform();
+    brush.ScaleTransform((float)source.Area.Width / source.Image.Width, (float)source.Area.Height / source.Image.Height);
+    brush.TranslateTransform(source.Area.X - origin.X, source.Area.Y - origin.Y, MatrixOrder.Append);
+    alignedOrigin = origin;
+   }
+   return brush;
+  }
+
+  public void Dispose() {
+   if (brush != null) { brush.Dispose(); brush = null; }
+   source = null;
   }
  }
 

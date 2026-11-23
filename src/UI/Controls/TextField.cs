@@ -120,6 +120,24 @@ namespace MacDeskNative {
    return g.MeasureString(s, font, PointF.Empty, Measure).Width;
   }
 
+  // Move to the nearest character boundary in a left-aligned field.
+  public void PlaceCaret(Graphics g, Font font, float x) {
+   x += scrollX;
+   int left = 0, right = text.Length;
+   while (right - left > 1) {
+    int middle = left + (right - left) / 2;
+    if (char.IsLowSurrogate(text[middle]) && char.IsHighSurrogate(text[middle - 1])) middle--;
+    if (middle == left) break;
+    if (Width(g, text.Substring(0, middle), font) < x) left = middle;
+    else right = middle;
+   }
+   float leftX = Width(g, text.Substring(0, left), font);
+   float rightX = Width(g, text.Substring(0, right), font);
+   caret = x < (leftX + rightX) / 2f ? left : right;
+   allSelected = false;
+   OnChanged();
+  }
+
   /// The shared field shape: a dark inset pill; focused fields get a blue ring.
   public static void DrawPill(Graphics g, RectangleF r, float radius, float alpha, bool focused) {
    if (alpha <= 0.01f) return;

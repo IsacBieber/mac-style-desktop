@@ -15,7 +15,8 @@ namespace MacDesk.Core {
  // desktop.json persistence: validate, atomic replace, hashed backups, cross-process lock.
  public class DesktopStore {
   public string Root { get; private set; }
-  public DesktopData Data { get; private set; }
+  volatile DesktopData data;
+  public DesktopData Data { get { return data; } }
   string original;
   readonly object gate = new object();
   static JavaScriptSerializer Serializer() { return new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 256 }; }
@@ -46,7 +47,7 @@ namespace MacDesk.Core {
     Validate(next);
     foreach (var group in next.groups)
      foreach (var item in group.items) EntryServices.NormalizeAppShortcut(item);
-    Data = next;
+    data = next;
     original = b == null ? null : Hash(b);
    }
   }
@@ -134,8 +135,8 @@ namespace MacDesk.Core {
        if (original != null) throw new IOException("原配置已被删除，请重新加载。");
        File.Move(temp, path);
       }
-      Data = next;
       original = Hash(bytes);
+      data = next;
      } finally { if (File.Exists(temp)) File.Delete(temp); }
     }
    }

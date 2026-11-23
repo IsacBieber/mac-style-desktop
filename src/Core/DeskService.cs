@@ -16,9 +16,9 @@ namespace MacDesk.Core {
  //   - IOException          : the file changed underneath us / could not be written
  //   - FileNotFoundException: launching an entry whose target is gone
  //  Messages are user-facing Chinese; the UI shows them as-is.
- //  Threading: call from one thread (the UI thread). Changed fires synchronously after save.
- //  The only methods safe on a worker thread are marked so (DiscoverApps, GetIcon, LoadIcon,
- //  OpenAppOnWorker).
+ //  The UI serializes reminder writes on a worker. The store serializes commits and publishes
+ //  read-only snapshots. Changed fires on the calling thread. Other UI commands call the
+ //  service on the UI thread unless the method documents worker use.
  // ============================================================================================
 
  /// What a change touched, so views can skip work that does not concern them.
@@ -360,18 +360,23 @@ namespace MacDesk.Core {
   /// deleted in the meantime are skipped; entries already in the requested state are ignored.
   public void SetTodosDone(IDictionary<string, bool> states) {
    if (states == null) throw new ArgumentNullException("states");
-   bool any = false;
-   foreach (var pair in states) { var t = FindTodo(pair.Key); if (t != null && t.done != pair.Value) { any = true; break; } }
-   if (!any) return;
+   if (states.Count == 0) return;
+   var requested = new Dictionary<string, bool>(states, StringComparer.Ordinal);
+   if (!Data.todos.Exists(t => TodoStateChanges(t, requested))) return;
    string stamp = Stamp();
    Edit(DeskChange.Todos, d => {
-    foreach (var pair in states) {
-     var t = d.todos.Find(v => v.id == pair.Key);
-     if (t == null || t.done == pair.Value) continue;
-     t.done = pair.Value;
-     t.completed = pair.Value ? stamp : "";
+    foreach (var t in d.todos) {
+     bool done;
+     if (!requested.TryGetValue(t.id, out done) || t.done == done) continue;
+     t.done = done;
+     t.completed = done ? stamp : "";
     }
    });
+  }
+
+  static bool TodoStateChanges(DeskTodo todo, IDictionary<string, bool> states) {
+   bool done;
+   return states.TryGetValue(todo.id, out done) && todo.done != done;
   }
 
   /// Moves a reminder to another day ("" or null = no date).

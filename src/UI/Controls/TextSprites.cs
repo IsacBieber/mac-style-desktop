@@ -4,9 +4,10 @@ using System.Drawing;
 using System.Drawing.Imaging;
 
 namespace MacDeskNative {
- // Pre-rendered single-line labels. TextStyle (filled glyph outlines) is crisp on our layered
- // surfaces but builds a path per call; animated lists draw the same strings every frame, so
- // each (text, font, color, width) is rendered once and then only blitted.
+ // Pre-rendered single-line labels for the day card and the reminders widget: each (text, font,
+ // color, width) is rendered once and then only blitted. Drawn as hinted (grid-fitted) text,
+ // not as filled outlines: at 12-17 px unhinted CJK outlines land between pixels and look
+ // smeared, the hinted glyphs snap their strokes to whole pixels.
  internal sealed class TextSprites : IDisposable {
   readonly Dictionary<string, Bitmap> cache = new Dictionary<string, Bitmap>();
   readonly ImageAttributes attributes = new ImageAttributes();
@@ -22,17 +23,26 @@ namespace MacDeskNative {
    if (cache.TryGetValue(key, out bmp)) return bmp;
    if (cache.Count >= Capacity) Clear();
    int h = (int)Math.Ceiling(px * 1.55f) + 2;
-   int w = Math.Min(maxWidth, (int)Math.Ceiling(TextStyle.Width(text, family, style, px)) + 6);
-   bmp = new Bitmap(Math.Max(1, w + 2), h, PixelFormat.Format32bppPArgb);
-   using (var g = Graphics.FromImage(bmp))
+   using (var font = new Font(TextStyle.Family(family), px, style, GraphicsUnit.Pixel))
    using (var f = Typographic()) {
-    g.Clear(Color.Transparent);
-    Ui.PrepareQuality(g);
-    TextStyle.Draw(g, text, family, style, px, color, new RectangleF(1, 0, w, h), f, weight);
+    if (measure == null) { measure = Graphics.FromImage(new Bitmap(1, 1)); measure.TextRenderingHint = Hint; }
+    // Hinted advances are rounded to whole pixels: measure with the same hint that draws.
+    int w = Math.Min(maxWidth, (int)Math.Ceiling(measure.MeasureString(text, font, PointF.Empty, f).Width) + 2);
+    bmp = new Bitmap(Math.Max(1, w + 2), h, PixelFormat.Format32bppPArgb);
+    using (var g = Graphics.FromImage(bmp))
+    using (var ink = new SolidBrush(color)) {
+     g.Clear(Color.Transparent);
+     g.TextRenderingHint = Hint;
+     g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.None;
+     g.DrawString(text, font, ink, new RectangleF(1, 0, w + 1, h), f);
+    }
    }
    cache[key] = bmp;
    return bmp;
   }
+
+  const System.Drawing.Text.TextRenderingHint Hint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+  static Graphics measure;
 
   // Measured and laid out the same way (no GDI+ side padding), so a label is never cut short.
   static StringFormat Typographic() {

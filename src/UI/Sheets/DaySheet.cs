@@ -26,7 +26,7 @@ namespace MacDeskNative {
    public readonly Spring Check = new Spring(0, 0.28, 0.62);
    public readonly Spring Fade = new Spring(1, 0.2, 1.0);
    public bool Placed;
-   public bool Step(double dt) { return Y.Step(dt) | Check.Step(dt) | Fade.Step(dt); }
+   public bool Step(double dt) { return Y.StepChanged(dt) | Check.StepChanged(dt) | Fade.StepChanged(dt); }
   }
   sealed class Row {
    public RowKind Kind;
@@ -47,15 +47,19 @@ namespace MacDeskNative {
   // Agenda / reorder: reminders ticked in this card stay where they were for a moment
   // (value > 0: seconds left in place; <= 0: fading out of the agenda).
   readonly Dictionary<string, double> lingering = new Dictionary<string, double>();
+  readonly List<string> lingeringIds = new List<string>();
   readonly TextField field = new TextField { MaxLength = DeskService.MaxTodoTitle };
   EditTarget edit = EditTarget.None;
   string editTodoId;
+  Point? lastImePosition;
   readonly Spring scroll = new Spring(0, 0.11, 1.0);
   float contentHeight;
+  int openCount;
   readonly TextSprites sprites = new TextSprites();
   readonly Font fieldFont = Ui.MakeFont(Ui.Cjk, Theme.Body, FontStyle.Regular);
   readonly Font noteFont = Ui.MakeFont(Ui.Cjk, Theme.Callout, FontStyle.Regular);
   int hoverRow = -1;
+  bool addButtonHovered, addButtonPressed;
   ContextMenuStrip menu;
 
   public DaySheet(AppController app) : base(app) {
@@ -68,6 +72,8 @@ namespace MacDeskNative {
   public string DateKey { get { return dateKey; } }
   internal bool Editing { get { return edit != EditTarget.None; } }
   internal string EditText { get { return field.Text; } }
+  // Keep the text sharp while opening. The layered window animates opacity on the cached pixels.
+  protected override float StartScale { get { return 1f; } }
 
   // ---- Opening ----------------------------------------------------------------------------
 
@@ -80,7 +86,7 @@ namespace MacDeskNative {
   void Show(SheetMode nextMode, string day, Rectangle besideScreen, RectangleF anchorScreen, bool startAdding) {
    bool switching = IsOpen && (nextMode != mode || day != dateKey);
    if (switching) CommitEdit(true, false);
-   if (!IsOpen || switching) { lingering.Clear(); scroll.Snap(0); hoverRow = -1; }
+   if (!IsOpen || switching) { lingering.Clear(); scroll.Snap(0); ClearHover(); }
    mode = nextMode;
    dateKey = day;
    todayKey = Reminders.TodayKey();
@@ -100,8 +106,9 @@ namespace MacDeskNative {
     CaptureGlass(new Rectangle(cardX, work.Top, CardWidth, work.Height));
    }
    Rebuild(!switching && Visible);
-   Relayout();
    if (startAdding) BeginNew();
+   if (!Visible) scroll.Snap(scroll.Target);
+   Relayout(true);
   }
 
   /// The data changed (save from here, the widget, or elsewhere).
@@ -112,14 +119,17 @@ namespace MacDeskNative {
    Relayout();
   }
 
-  void Relayout() {
-   int height = (int)Math.Ceiling(Math.Min(maxCardHeight, HeaderH + contentHeight + BottomPad));
-   PresentCard(new Rectangle(cardX, cardTop, CardWidth, height), anchor);
+  int LayoutHeight { get { return (int)Math.Ceiling(Math.Min(maxCardHeight, HeaderH + contentHeight + BottomPad)); } }
+
+  void Relayout(bool opening = false) {
+   var card = new Rectangle(cardX, cardTop, CardWidth, LayoutHeight);
    ClampScroll();
-   RedrawCard();
+   if (opening || (IsOpen && CardScreenRect != card)) PresentCard(card, anchor, opening);
+   else if (!Visible && CardSize != card.Size) SizeCardForTest(card.Size);
+   else RedrawCard();
   }
 
-  float ViewHeight { get { return Math.Max(1, CardSize.Height - HeaderH - BottomPad); } }
+  float ViewHeight { get { return Math.Max(1, LayoutHeight - HeaderH - BottomPad); } }
   void ClampScroll() {
    float max = Math.Max(0, contentHeight - ViewHeight);
    if (scroll.Target > max) scroll.Target = max;
@@ -145,6 +155,7 @@ namespace MacDeskNative {
   // animate: rows that already exist glide to their new places; new ones fade in.
   void Rebuild(bool animate) {
    rows.Clear();
+   openCount = 0;
    var data = app.Data;
    var todos = data.todos ?? new List<DeskTodo>();
    float y = 0;
@@ -165,19 +176,16 @@ namespace MacDeskNative {
     string note = app.Service.GetNote(dateKey);
     AddRow(RowKind.Note, "note", null, note, Theme.Orange, null, Color.Empty, NoteH, ref y);
    } else {
-    var shown = new HashSet<string>();
-    var sections = new[] { TodoQueries.AgendaSection.Overdue, TodoQueries.AgendaSection.Today, TodoQueries.AgendaSection.Undated };
-    var agenda = TodoQueries.Agenda(data, todayKey);
-    foreach (var section in sections) {
-     var list = new List<DeskTodo>();
-     foreach (var entry in agenda) if (entry.Section == section) list.Add(entry.Todo);
-     // Reminders completed here linger in their section briefly before fading out.
-     foreach (var t in todos) if (lingering.ContainsKey(t.id) && SectionOf(t) == section && !list.Contains(t)) InsertInOrder(list, t, todos);
-     if (list.Count == 0) continue;
-     string title = section == TodoQueries.AgendaSection.Overdue ? "已逾期" : section == TodoQueries.AgendaSection.Today ? "今天" : "未定日期";
-     Color color = section == TodoQueries.AgendaSection.Overdue ? Theme.Red : section == TodoQueries.AgendaSection.Today ? Theme.Label : Theme.SecondaryLabel;
-     AddRow(RowKind.Section, "section:" + section, null, title, color, null, Color.Empty, SectionH, ref y);
-     foreach (var t in list) { AddTodoRow(t, ref y); shown.Add(t.id); }
+    TodoQueries.AgendaSection? previous = null;
+    foreach (var entry in TodoQueries.Agenda(data, todayKey, t => !ShownDone(t) || lingering.ContainsKey(t.id))) {
+     var section = entry.Section;
+     if (section != previous) {
+      string title = section == TodoQueries.AgendaSection.Overdue ? "已逾期" : section == TodoQueries.AgendaSection.Today ? "今天" : "未定日期";
+      Color color = section == TodoQueries.AgendaSection.Overdue ? Theme.Red : section == TodoQueries.AgendaSection.Today ? Theme.Label : Theme.SecondaryLabel;
+      AddRow(RowKind.Section, "section:" + section, null, title, color, null, Color.Empty, SectionH, ref y);
+      previous = section;
+     }
+     AddTodoRow(entry.Todo, ref y);
     }
     AddRow(RowKind.Add, "add", null, "新提醒事项", Theme.BlueOnGlass, null, Color.Empty, RowH, ref y);
    }
@@ -199,25 +207,16 @@ namespace MacDeskNative {
     if (row.Todo != null) {
      s.Check.Target = ShownDone(row.Todo) ? 1 : 0;
      double left;
-     if (mode == SheetMode.Agenda && ShownDone(row.Todo) && lingering.TryGetValue(row.Todo.id, out left) && left <= 0) s.Fade.Target = 0;
+     s.Fade.Target = mode == SheetMode.Agenda && ShownDone(row.Todo) && lingering.TryGetValue(row.Todo.id, out left) && left <= 0 ? 0 : 1;
     }
    }
    foreach (var key in new List<string>(states.Keys)) if (!alive.Contains(key)) states.Remove(key);
    if (editTodoId != null && edit == EditTarget.RenameTodo && rows.Find(r => r.Todo != null && r.Todo.id == editTodoId) == null) { edit = EditTarget.None; editTodoId = null; }
   }
 
-  TodoQueries.AgendaSection SectionOf(DeskTodo t) {
-   if (String.IsNullOrEmpty(t.due)) return TodoQueries.AgendaSection.Undated;
-   return String.CompareOrdinal(t.due, todayKey) < 0 ? TodoQueries.AgendaSection.Overdue : TodoQueries.AgendaSection.Today;
-  }
-  static void InsertInOrder(List<DeskTodo> list, DeskTodo t, List<DeskTodo> all) {
-   int index = all.IndexOf(t), at = list.Count;
-   for (int i = 0; i < list.Count; i++) if (all.IndexOf(list[i]) > index && list[i].due == t.due) { at = i; break; }
-   list.Insert(at, t);
-  }
-
   void AddTodoRow(DeskTodo t, ref float y) {
    bool done = ShownDone(t);
+   if (!done) openCount++;
    string trailing = null;
    Color trailingColor = Theme.SecondaryLabel;
    if (mode == SheetMode.Agenda && !String.IsNullOrEmpty(t.due) && t.due != todayKey) { trailing = Reminders.RelativeDay(t.due, todayKey); trailingColor = Theme.Red; }
@@ -277,12 +276,21 @@ namespace MacDeskNative {
    string id = editTodoId, text = field.Text.Trim();
    edit = EditTarget.None;
    editTodoId = null;
+   lastImePosition = null;
    if (save) {
-    if (target == EditTarget.NewTodo && text.Length > 0) app.AddTodo(text, NewTodoDue);
-    else if (target == EditTarget.RenameTodo && text.Length > 0 && id != null) {
-     var t = app.Service.FindTodo(id);
-     if (t != null && t.title != text) app.RenameTodo(id, text);
-    } else if (target == EditTarget.Note) app.SetCalendarNote(dateKey, text);
+    string day = dateKey;
+    if (target == EditTarget.NewTodo && text.Length > 0) {
+     string due = NewTodoDue;
+     app.SaveReminder(s => s.AddTodo(text, due), delegate(Exception error) {
+      if (error != null && IsOpen && dateKey == day && edit == EditTarget.NewTodo && field.Text.Length == 0) field.Reset(text, false);
+     });
+    } else if (target == EditTarget.RenameTodo && text.Length > 0 && id != null) {
+     app.SaveReminder(delegate(DeskService service) {
+      var current = service.FindTodo(id);
+      if (current != null && current.title != text) service.RenameTodo(id, text);
+     });
+    }
+    else if (target == EditTarget.Note) app.SaveReminder(s => s.SetNote(day, text));
    }
    if (keepAdding && target == EditTarget.NewTodo && text.Length > 0 && IsOpen) { edit = EditTarget.NewTodo; field.Reset("", false); }
    RedrawCard();
@@ -298,7 +306,7 @@ namespace MacDeskNative {
   void Toggle(DeskTodo t) {
    bool next = !ShownDone(t);
    // Stay in place for a moment (and in the agenda, fade out afterwards) before reordering.
-   lingering[t.id] = LingerSeconds;
+   if (next) lingering[t.id] = LingerSeconds; else lingering.Remove(t.id);
    app.ToggleTodoSoon(t.id, next);
    Rebuild(true);
    RedrawCard();
@@ -349,15 +357,39 @@ namespace MacDeskNative {
    states.Clear();
    rows.Clear();
    sprites.Clear();
-   hoverRow = -1;
+   ClearHover();
   }
+
+  void ClearHover() {
+   hoverRow = -1;
+   addButtonHovered = addButtonPressed = false;
+  }
+
+  bool AddButtonAt(Point p, int row) { return row >= 0 && rows[row].Kind == RowKind.Add && p.X < TextX - 4; }
 
   protected override void OnCardMouseMove(Point p) {
    int next = RowAt(p);
-   if (next != hoverRow) { hoverRow = next; RedrawCard(); }
-   Cursor = next >= 0 && rows[next].Kind != RowKind.Section ? Cursors.Hand : Cursors.Default;
+   bool overAddButton = AddButtonAt(p, next);
+   if (next != hoverRow || overAddButton != addButtonHovered) {
+    hoverRow = next;
+    addButtonHovered = overAddButton;
+    RedrawCard();
+   }
+   if (next < 0 || rows[next].Kind == RowKind.Section) Cursor = Cursors.Default;
+   else Cursor = rows[next].Kind == RowKind.Add && !overAddButton ? Cursors.IBeam : Cursors.Hand;
   }
-  protected override void OnCardMouseLeave() { if (hoverRow != -1) { hoverRow = -1; RedrawCard(); } }
+
+  protected override void OnCardMouseLeave() {
+   if (hoverRow == -1 && !addButtonPressed) return;
+   ClearHover();
+   RedrawCard();
+  }
+
+  protected override void OnCardMouseDown(Point p, MouseButtons button) {
+   if (button != MouseButtons.Left || !AddButtonAt(p, RowAt(p))) return;
+   addButtonPressed = true;
+   RedrawCard();
+  }
 
   protected override void OnCardMouseWheel(Point p, int delta) {
    scroll.Target -= delta / 120f * RowH * 1.5f;
@@ -366,6 +398,11 @@ namespace MacDeskNative {
   }
 
   protected override void OnCardMouseUp(Point p, MouseButtons button) {
+   bool pressedAdd = button == MouseButtons.Left && addButtonPressed;
+   if (pressedAdd) {
+    addButtonPressed = false;
+    RedrawCard();
+   }
    int i = RowAt(p);
    if (i < 0) { if (button == MouseButtons.Left) CommitEdit(true, false); return; }
    Row row = rows[i];
@@ -381,6 +418,17 @@ namespace MacDeskNative {
      break;
     case RowKind.Add:
      if (edit != EditTarget.NewTodo) BeginNew();
+     else if (AddButtonAt(p, i)) {
+      if (pressedAdd && !String.IsNullOrWhiteSpace(field.Text)) CommitEdit(true, true);
+     } else if (field.Text.Length > 0) {
+      using (var g = CreateGraphics()) {
+       Ui.PrepareQuality(g);
+       field.PlaceCaret(g, fieldFont, p.X - TextX);
+      }
+     }
+     if (IsOpen) app.PushKeyTarget(this);
+     lastImePosition = null;
+     RedrawCard();
      break;
     case RowKind.Note:
      if (edit != EditTarget.Note) BeginNote();
@@ -397,14 +445,15 @@ namespace MacDeskNative {
    menu = new ContextMenuStrip();
    PanelDrawing.StyleMenu(menu);
    string id = t.id, tomorrow = Reminders.AddDays(todayKey, 1), nextWeek = Reminders.AddDays(todayKey, 7);
-   if (t.due != todayKey) AddMenuItem("改到今天", delegate { app.SetTodoDue(id, todayKey); });
-   if (t.due != tomorrow) AddMenuItem("改到明天", delegate { app.SetTodoDue(id, tomorrow); });
-   AddMenuItem("推迟一周", delegate { app.SetTodoDue(id, nextWeek); });
-   if (!String.IsNullOrEmpty(t.due)) AddMenuItem("移除日期", delegate { app.SetTodoDue(id, ""); });
+   string today = todayKey;
+   if (t.due != today) AddMenuItem("改到今天", () => app.SaveReminder(s => s.SetTodoDue(id, today)));
+   if (t.due != tomorrow) AddMenuItem("改到明天", () => app.SaveReminder(s => s.SetTodoDue(id, tomorrow)));
+   AddMenuItem("推迟一周", () => app.SaveReminder(s => s.SetTodoDue(id, nextWeek)));
+   if (!String.IsNullOrEmpty(t.due)) AddMenuItem("移除日期", () => app.SaveReminder(s => s.SetTodoDue(id, "")));
    menu.Items.Add(new ToolStripSeparator());
    AddMenuItem("重命名", delegate { var current = app.Service.FindTodo(id); if (current != null) BeginRename(current); });
    menu.Items.Add(new ToolStripSeparator());
-   ToolStripItem remove = AddMenuItem("删除", delegate { app.DeleteTodo(id); });
+   ToolStripItem remove = AddMenuItem("删除", () => app.SaveReminder(s => s.DeleteTodo(id)));
    remove.Tag = PanelDrawing.Destructive;
    var shown = menu;
    shown.Closed += delegate { BeginInvoke((MethodInvoker)delegate { if (!shown.IsDisposed) shown.Dispose(); }); };
@@ -417,19 +466,22 @@ namespace MacDeskNative {
 
   // ---- Animation and drawing ------------------------------------------------------------
 
+  protected override bool CardHasPendingWork { get { return lingering.Count > 0; } }
+
   protected override bool StepCard(double dt) {
-   bool moving = scroll.Step(dt);
+   bool moving = scroll.StepChanged(dt);
    foreach (var row in rows) moving |= row.State.Step(dt);
    if (lingering.Count > 0) {
     bool rebuild = false;
-    foreach (var id in new List<string>(lingering.Keys)) {
+    lingeringIds.Clear();
+    lingeringIds.AddRange(lingering.Keys);
+    foreach (var id in lingeringIds) {
      double before = lingering[id], after = before - dt;
      lingering[id] = after;
-     if (before > 0 && after <= 0) rebuild = true;           // stop holding its place
-     if (after <= -0.25) { lingering.Remove(id); rebuild = true; } // faded out of the agenda
+     if (before > 0 && after <= 0) rebuild = true;
+     if (after <= (mode == SheetMode.Day ? 0 : -0.25)) { lingering.Remove(id); rebuild = true; }
     }
-    if (rebuild) { Rebuild(true); Relayout(); }
-    moving = true;
+    if (rebuild) { Rebuild(true); Relayout(); moving = true; }
    }
    return moving;
   }
@@ -460,20 +512,19 @@ namespace MacDeskNative {
     else if (day.Year != Reminders.Today().Year) sprites.Draw(g, day.Year + "年", Ui.Cjk, FontStyle.Regular, Theme.Footnote, Theme.SecondaryLabel, 0.2f, w - PadX - 44, 37, 60);
    } else {
     int titleW = sprites.Draw(g, "提醒事项", Ui.Cjk, FontStyle.Bold, Theme.LargeTitle, Theme.BlueOnGlass, 0.15f, PadX, 34, 220);
-    int open = 0;
-    foreach (var row in rows) if (row.Todo != null && !ShownDone(row.Todo)) open++;
-    sprites.Draw(g, open > 0 ? open + " 项" : "全部完成", Ui.Cjk, FontStyle.Regular, Theme.Footnote, Theme.SecondaryLabel, 0.2f, PadX + titleW + 8, 37, 90);
+    sprites.Draw(g, openCount > 0 ? openCount + " 项" : "全部完成", Ui.Cjk, FontStyle.Regular, Theme.Footnote, Theme.SecondaryLabel, 0.2f, PadX + titleW + 8, 37, 90);
     DrawChip(g, Reminders.MonthDay(Reminders.Parse(todayKey)), Theme.Red, w - PadX, 34);
    }
   }
 
+  // A solid pill with white text (iOS badge): red text on a tinted pill blurs into the glass.
   void DrawChip(Graphics g, string text, Color color, float right, float cy) {
-   var bmp = sprites.Get(text, Ui.Cjk, FontStyle.Bold, Theme.Caption, color, 0.1f, 120);
+   var bmp = sprites.Get(text, Ui.Cjk, FontStyle.Bold, Theme.Caption, Color.White, 0.1f, 120);
    if (bmp == null) return;
    float tw = bmp.Width - 2, h = 22, width = tw + 18;
-   var r = new RectangleF(right - width, cy - h / 2f, width, h);
+   var r = new RectangleF((float)Math.Round(right - width), (float)Math.Round(cy - h / 2f), (float)Math.Round(width), h);
    using (var path = Ui.Squircle(r, h / 2f))
-   using (var b = new SolidBrush(Color.FromArgb(48, color))) g.FillPath(b, path);
+   using (var b = new SolidBrush(Color.FromArgb(255, color))) g.FillPath(b, path);
    Ui.Blit(g, bmp, (int)Math.Round(r.X + 9) - 1, (int)Math.Round(cy - bmp.Height / 2f));
   }
 
@@ -505,15 +556,18 @@ namespace MacDeskNative {
       using (var pen = new Pen(Ui.WithAlpha(Theme.Separator, alpha), 1f)) g.DrawLine(pen, TextX, top + row.Height - 0.5f, w - PadX, top + row.Height - 0.5f);
      break;
     }
-    case RowKind.Add:
+    case RowKind.Add: {
+     bool overButton = index == hoverRow && addButtonHovered;
+     float diameter = addButtonPressed && overButton ? CheckD - 2 : overButton ? CheckD + 2 : CheckD;
+     Reminders.DrawPlusDisc(g, new PointF(PadX + 12, cy), diameter, 1f);
      if (editingThis) {
-      Reminders.DrawCheck(g, new PointF(PadX + 12, cy), CheckD, 0, Theme.TertiaryLabel, 1f);
+      TextField.DrawPill(g, new RectangleF(TextX - 7, top + 5, textMax + 10, row.Height - 10), 8f, 0.8f, false);
       DrawField(g, new RectangleF(TextX, top + 6, textMax, row.Height - 12), "新提醒事项");
      } else {
-      Reminders.DrawPlusDisc(g, new PointF(PadX + 12, cy), CheckD, 1f);
       sprites.Draw(g, row.Text, Ui.Cjk, FontStyle.Regular, Theme.Body, Theme.BlueOnGlass, 0.15f, TextX, cy, textMax);
      }
      break;
+    }
     case RowKind.Note: {
      using (var pen = new Pen(Theme.Separator, 1f)) g.DrawLine(pen, PadX, top + 6.5f, w - PadX, top + 6.5f);
      float ncy = cy + 3;
@@ -529,7 +583,10 @@ namespace MacDeskNative {
   void DrawField(Graphics g, RectangleF r, string placeholder) {
    field.Draw(g, r, edit == EditTarget.Note ? noteFont : fieldFont, false, placeholder, edit == EditTarget.Note ? Theme.Orange : Theme.Label);
    // Let the IME composition / candidate window follow the caret.
-   if (app.DesktopFolders != null && !app.DesktopFolders.IsDisposed) app.DesktopFolders.PlaceImeWindow(CardToScreen(new PointF(field.CaretPoint.X - 2, field.CaretPoint.Y + 2)));
+   if (app.DesktopFolders != null && !app.DesktopFolders.IsDisposed) {
+    Point position = CardToScreen(new PointF(field.CaretPoint.X - 2, field.CaretPoint.Y + 2));
+    if (position != lastImePosition && app.DesktopFolders.PlaceImeWindow(position)) lastImePosition = position;
+   }
   }
 
   void DrawScrollHint(Graphics g, float w) {
@@ -552,7 +609,7 @@ namespace MacDeskNative {
    maxCardHeight = Math.Min(work.Bottom - 12 - cardTop, (int)(work.Height * 0.78));
    foreach (var s in states.Values) s.Placed = false;
    Rebuild(false);
-   SizeCardForTest(new Size(CardWidth, (int)Math.Ceiling(Math.Min(maxCardHeight, HeaderH + contentHeight + BottomPad))));
+   SizeCardForTest(new Size(CardWidth, LayoutHeight));
   }
   internal void BeginNewForTest() { BeginNew(); }
   /// Ticks the first open reminder shown (bench: the check animation).

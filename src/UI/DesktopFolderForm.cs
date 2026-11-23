@@ -24,6 +24,7 @@ namespace MacDeskNative {
   readonly HashSet<ContextMenuStrip> menus = new HashSet<ContextMenuStrip>();
   readonly Font caption = Ui.MakeFont(Ui.Cjk, 12.5f, FontStyle.Regular);
   readonly LayeredSurface surface = new LayeredSurface();
+  readonly DesktopGlassBrush wallpaperGlass = new DesktopGlassBrush(0.42f, Material.FolderTint);
   readonly FramePump pump;
   readonly Spring ghostAlpha = new Spring(0, 0.18, 1.0);
   readonly Dictionary<string, Bitmap> faces = new Dictionary<string, Bitmap>();
@@ -56,17 +57,9 @@ namespace MacDeskNative {
    public bool PaintDirty;
    public HashSet<string> MissingIcons;
    public bool Placed;
-   // Frosted body texture (2x) and the pre-rendered label.
-   public Bitmap Sprite, LabelSprite;
-   public TextureBrush BodyBrush;
-   public Backdrop BodySource;
-   public Rectangle BodySample;
+   public Bitmap LabelSprite;
    public string LabelKey;
-   public void DisposeSprites(bool keepLabel = false) {
-    if (BodyBrush != null) { BodyBrush.Dispose(); BodyBrush = null; }
-    if (Sprite != null) { Sprite.Dispose(); Sprite = null; }
-    BodySource = null;
-    if (keepLabel) return;
+   public void DisposeLabel() {
     if (LabelSprite != null) { LabelSprite.Dispose(); LabelSprite = null; }
     LabelKey = null;
    }
@@ -169,15 +162,6 @@ namespace MacDeskNative {
     }
     WakeAnim();
    }
-   if (old != null && old.Reserved != next.Reserved) {
-    foreach (var tile in tiles) {
-     Rectangle before = tile.Drawn.IntersectsWith(old.Reserved) ? Rectangle.Intersect(tile.Drawn, old.Reserved) : Rectangle.Empty;
-     Rectangle after = tile.Drawn.IntersectsWith(next.Reserved) ? Rectangle.Intersect(tile.Drawn, next.Reserved) : Rectangle.Empty;
-     if (before == after) continue;
-     tile.PaintDirty = true;
-     WakeAnim();
-    }
-   }
   }
 
   public void RefreshData() {
@@ -201,6 +185,7 @@ namespace MacDeskNative {
     var bounds = new Rectangle(CellPos(index), new Size(TileWidth, TileHeight));
     FolderTile tile;
     if (!previous.TryGetValue(group.id, out tile)) tile = new FolderTile();
+    else previous.Remove(group.id);
     tile.Id = group.id; tile.Title = group.title; tile.Group = group; tile.Bounds = bounds; tile.Index = index++; tile.Plus = false;
     string key = FaceKey(group);
     if (tile.FaceKey != key) tile.MissingIcons = null;
@@ -212,9 +197,11 @@ namespace MacDeskNative {
    var add = new Rectangle(CellPos(index), new Size(TileWidth, TileHeight));
    FolderTile plus;
    if (!previous.TryGetValue("+", out plus)) { plus = new FolderTile(); plus.Alpha.Snap(0.0); }
+   else previous.Remove("+");
    plus.Id = null; plus.Title = "新建"; plus.Plus = true; plus.Group = null; plus.Bounds = add; plus.Index = index;
    Place(plus, add);
    tiles.Add(plus);
+   foreach (var removed in previous.Values) removed.DisposeLabel();
    scroll = Math.Min(scroll, grid.MaxScroll(tiles.Count));
    if (hover != null && !tiles.Contains(hover)) hover = null;
    dropTarget = null;
@@ -499,54 +486,21 @@ namespace MacDeskNative {
 
   void DrawFolderBody(Graphics g, RectangleF icon) {
    float radius = icon.Width * 0.2237f;
-   Point origin = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
-   Rectangle region = Rectangle.Inflate(Rectangle.Ceiling(icon), 2, 2);
-   region.Offset(origin);
-   Backdrop wallpaper = Wallpaper.Current;
-   using (var brush = wallpaper == null ? null : wallpaper.CreateBrush(region, origin))
-   using (var shape = Ui.Squircle(icon, radius)) Material.Fill(g, shape, brush, Material.FolderTint, Material.FolderFallback);
+   using (var shape = Ui.Squircle(icon, radius)) FillFolderGlass(g, shape, GlassBrush());
    Material.Rim(g, icon, radius, 0.75f);
+  }
+
+  static void FillFolderGlass(Graphics g, GraphicsPath shape, TextureBrush glass) {
+   Material.Fill(g, shape, glass, glass == null ? Material.FolderTint : Color.Transparent, Material.FolderFallback);
+  }
+
+  TextureBrush GlassBrush() {
+   Point origin = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
+   return wallpaperGlass.At(Wallpaper.Current, origin);
   }
 
   readonly System.Drawing.Imaging.ImageAttributes spriteAttributes = new System.Drawing.Imaging.ImageAttributes();
   readonly System.Drawing.Imaging.ColorMatrix spriteMatrix = new System.Drawing.Imaging.ColorMatrix();
-
-  // The folder's frosted wallpaper and tint rendered once at 2x as a
-  // square texture. Its outline is NOT baked in: every frame fills the exact squircle as a
-  // vector shape with this texture, and draws the rim as a vector line, so the edge stays
-  // crisp at any hover scale. (Resampling a pre-rendered outline made the 1 px rim alternate
-  // between sharp and blurred as it crossed sub-pixel positions: the "whole frame shakes".)
-  TextureBrush BodyBrush(FolderTile tile) {
-   if (dragging && tile == pressed && tile.BodyBrush != null) return tile.BodyBrush; // keep the material while carried
-   Backdrop bd = Wallpaper.Current;
-   int restX = tile.Bounds.X + (TileWidth - IconSize) / 2, restY = tile.Bounds.Y + IconTop - scroll;
-   Point origin = IsHandleCreated ? PointToScreen(Point.Empty) : Location;
-   var region = new Rectangle(origin.X + restX - 2, origin.Y + restY - 2, IconSize + 4, IconSize + 4);
-   if (tile.BodyBrush != null && tile.BodySource == bd) {
-    // Carry the glass texture with the frame during reflow. Resample once at its final slot.
-    if (tile.BodySample == region || !tile.X.Settled || !tile.Y.Settled) return tile.BodyBrush;
-   }
-   tile.DisposeSprites(keepLabel: true);
-   int side = IconSize * 2;
-   var bmp = new Bitmap(side, side, PixelFormat.Format32bppPArgb);
-   using (var g = Graphics.FromImage(bmp)) {
-    g.Clear(Color.Transparent);
-    Ui.PrepareQuality(g);
-    g.ScaleTransform(2f, 2f);
-    g.TranslateTransform(-restX, -restY); // window coordinates: screen-aligned material lines up
-    var icon = new RectangleF(restX, restY, IconSize, IconSize);
-    using (var brush = bd == null ? null : bd.CreateBrush(region, origin)) {
-     if (brush != null) g.FillRectangle(brush, icon);
-     else using (var b = new SolidBrush(Material.FolderFallback)) g.FillRectangle(b, icon);
-    }
-    using (var b = new SolidBrush(Material.FolderTint)) g.FillRectangle(b, icon);
-   }
-   tile.Sprite = bmp;
-   tile.BodyBrush = new TextureBrush(bmp, WrapMode.Clamp);
-   tile.BodySource = bd;
-   tile.BodySample = region;
-   return tile.BodyBrush;
-  }
 
   Bitmap LabelSprite(FolderTile tile) {
    string key = tile.Title ?? "";
@@ -564,7 +518,7 @@ namespace MacDeskNative {
    return bmp;
   }
 
-  void DrawTile(Graphics g, FolderTile tile) {
+  void DrawTile(Graphics g, FolderTile tile, TextureBrush glass) {
    DrawHitPlate(g, tile);
    float alpha = (float)Math.Max(0, Math.Min(1, tile.Alpha.Value));
    if (alpha <= 0.02f) return;
@@ -598,11 +552,7 @@ namespace MacDeskNative {
       g.DrawLine(pen, cx, cy - arm, cx, cy + arm);
      }
     } else {
-     TextureBrush body = BodyBrush(tile);
-     body.ResetTransform();
-     body.TranslateTransform(icon.X, icon.Y);
-     body.ScaleTransform(s * 0.5f, s * 0.5f);
-     g.FillPath(body, shape);
+     FillFolderGlass(g, shape, glass);
      // Hover just brightens the glass a touch.
      if (hover > 0.01f) using (var b = new SolidBrush(Color.FromArgb((int)(30 * hover), 255, 255, 255))) g.FillPath(b, shape);
     }
@@ -655,7 +605,8 @@ namespace MacDeskNative {
     }
     surface.Clear(dirty); // the clip clears only the changed rectangles
     g.SetClip(grid.Viewport, CombineMode.Intersect);
-    if (!grid.Reserved.IsEmpty) g.ExcludeClip(grid.Reserved);
+    // Reservation decides the landing slots. The widget window above this surface handles
+    // visual overlap while a folder is moving, keeping its outline intact.
 
     if (ghostAlpha.Value > 0.01 && !magneticPreview.IsEmpty && g.IsVisible(ghost)) {
      var slot = magneticPreview; slot.Offset(0, -scroll);
@@ -666,15 +617,16 @@ namespace MacDeskNative {
     }
     ghostDrawn = ghost;
 
+    TextureBrush glass = GlassBrush();
     FolderTile top = null;
     foreach (var tile in tiles) {
      tile.Drawn = tile.PaintArea;
      tile.PaintDirty = false;
      if (!g.IsVisible(tile.Drawn)) continue;
      if (dragging && tile == pressed) { top = tile; continue; }
-     DrawTile(g, tile);
+     DrawTile(g, tile, glass);
     }
-    if (top != null) DrawTile(g, top);
+    if (top != null) DrawTile(g, top, glass);
 
     if (grid.MaxScroll(tiles.Count) > 0) {
      Rectangle viewport = grid.Viewport;
@@ -916,16 +868,17 @@ namespace MacDeskNative {
   }
 
   // Puts the IME composition/candidate window at a screen point (the field being typed into).
-  internal void PlaceImeWindow(Point screen) {
-   if (!IsHandleCreated) return;
+  internal bool PlaceImeWindow(Point screen) {
+   if (!IsHandleCreated) return false;
    IntPtr ctx = ImmGetContext(Handle);
-   if (ctx == IntPtr.Zero) return;
+   if (ctx == IntPtr.Zero) return false;
    try {
     Point p = PointToClient(screen);
     var comp = new COMPOSITIONFORM { dwStyle = 0x0002, x = p.X, y = p.Y }; // CFS_POINT
     ImmSetCompositionWindow(ctx, ref comp);
     var cand = new CANDIDATEFORM { dwIndex = 0, dwStyle = 0x0040, x = p.X, y = p.Y }; // CFS_CANDIDATEPOS
     ImmSetCandidateWindow(ctx, ref cand);
+    return true;
    } finally { ImmReleaseContext(Handle, ctx); }
   }
   [StructLayout(LayoutKind.Sequential)] struct COMPOSITIONFORM { public int dwStyle, x, y, l, t, r, b; }
@@ -1046,7 +999,8 @@ namespace MacDeskNative {
     menus.Clear();
     foreach (var f in faces.Values) f.Dispose();
     faces.Clear();
-    foreach (var t in tiles) t.DisposeSprites();
+    foreach (var t in tiles) t.DisposeLabel();
+    wallpaperGlass.Dispose();
     spriteAttributes.Dispose();
     surface.Dispose();
     dirtyClip.Dispose();
